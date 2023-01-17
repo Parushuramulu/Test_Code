@@ -1,0 +1,17 @@
+version: '3'
+services:
+  spark:
+    build:
+      context: .
+      dockerfile: SparkJobDockerfile
+    volumes:
+      - /path/to/input/csv:/input
+      - /path/to/delta/table:/output
+    command: /sbin/tini -S /opt/spark/bin/spark-submit --conf spark.history.fs.logDirectory=/path/to/log/dir SparkJob.py
+  spark-history-server:
+    image: spark-history-server:latest
+    ports:
+      - 18080:18080
+    volumes:
+      - /path/to/log/dir:/path/to/log/dir
+    command: -Dspark.history.fs.logDirectory=/path/to/log/dir org.apache.spark.deploy.history.HistoryServer
