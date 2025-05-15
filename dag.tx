@@ -1,0 +1,4206 @@
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python_operator import PythonOperator
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.amazon.aws.operators.emr import (
+    EmrAddStepsOperator,
+    EmrCreateJobFlowOperator,
+    EmrTerminateJobFlowOperator,
+)
+from airflow.providers.amazon.aws.sensors.emr import (EmrJobFlowSensor, EmrStepSensor)
+from airflow.providers.amazon.aws.operators.step_function import (
+    StepFunctionStartExecutionOperator,
+)
+from airflow.providers.amazon.aws.sensors.step_function import StepFunctionExecutionSensor
+from airflow.models.baseoperator import chain
+
+
+import boto3
+import os
+from datetime import datetime
+import time
+import timeit
+
+
+ENV = Variable.get("ENV")
+DAG_ID = os.path.basename(__file__).replace(".py", "")
+
+
+### airflow process
+### boto3 objects
+s3_client = boto3.client('s3')
+athena_client = boto3.client('athena')
+glue_client = boto3.client("glue")
+s3_hook = S3Hook()
+
+S3_BUCKET = f'gilead-ds-lakebound-data-store-{ENV}'
+S3_KEY_ATHENA_RESULT ='athena-query-results/airflow'
+ATHENA_DATABASE= 'gilead_ds_datalake_gilda_bronze'
+CTMS_VIEW_QUERY_S3_PATH ='artifacts/gilda/ctms_view_query/'
+CTMS_VIEW_QUERY_RESULT_S3_PATH = 'silver/gilda'
+GILDA_BRONZE_DB = 'gilead_ds_datalake_gilda_bronze'
+GILDA_SILVER_DB = 'gilead_ds_datalake_gilda_silver'
+GILDA_BRONZE_CRAWLER = 'gilead_ds_datalake_gilda_bronze_crawler'
+GILDA_SILVER_CRAWLER = 'gilead_ds_datalake_gilda_silver_crawler_s3'
+
+
+## Functions
+def run_crawler(crawler_name):
+    ## Run the AWS Glue crawler
+    timeout_minutes = 120
+    retry_seconds = 5
+    timeout_seconds = timeout_minutes * 60
+    start_time = timeit.default_timer()
+    abort_time = start_time + timeout_seconds
+
+    def wait_until_ready() -> None:
+            state_previous = None
+            while True:
+                response_get = glue_client.get_crawler(Name=crawler_name)
+                state = response_get["Crawler"]["State"]
+                if state != state_previous:
+                    print(f"Crawler {crawler_name} is {state.lower()}.")
+                    state_previous = state
+                if state == "READY":  # Other known states: RUNNING, STOPPING
+                    return
+                if timeit.default_timer() > abort_time:
+                    raise TimeoutError(f"Failed to crawl {crawler_name}. The allocated time of {timeout_minutes:,} minutes has elapsed.")
+                time.sleep(retry_seconds)
+
+    wait_until_ready()
+    response_start = glue_client.start_crawler(Name=crawler_name)
+    assert response_start["ResponseMetadata"]["HTTPStatusCode"] == 200
+    print(f"Crawling {crawler_name}.")
+    wait_until_ready()
+    print(f"Crawled {crawler_name}.")
+
+def check_is_glue_catalog_tables_exist(database_name):
+    return False
+    ## Check tables are avilable or not
+    res = glue_client.get_tables(DatabaseName = database_name )
+    print(res)
+    if 'TableList' in res and  len(res['TableList']):
+        print("database has tables")
+        return True
+    else:
+        print("database has no tables")
+        return False
+
+def call_crawler_if_bronze_table_not_exist():
+    tables_avilable = check_is_glue_catalog_tables_exist(GILDA_BRONZE_DB)
+    if tables_avilable:
+        print(f'Tables already available in the aws glue catalog db {GILDA_BRONZE_DB}')
+        return False
+    else:
+        print(f'Tables are not available in the aws glue catalog db {GILDA_BRONZE_DB} Run the crawler')
+        crawler_res = run_crawler(GILDA_BRONZE_CRAWLER)
+        return True
+
+
+def get_files():
+    keys = s3_hook.list_keys(bucket_name = S3_BUCKET, prefix=CTMS_VIEW_QUERY_S3_PATH)
+    if CTMS_VIEW_QUERY_S3_PATH in keys:
+        keys.remove(CTMS_VIEW_QUERY_S3_PATH)
+
+    sql_files_list = list(map(lambda x: x.replace(CTMS_VIEW_QUERY_S3_PATH,''), keys))
+    print(sql_files_list)
+    for file in sql_files_list:
+        print(file)
+
+    return sql_files_list
+
+
+def get_sql_query(file_name):
+    if s3_hook.check_for_key(f'{CTMS_VIEW_QUERY_S3_PATH}{file_name}',S3_BUCKET):
+        file_obj = s3_hook.get_conn().get_object(Bucket=S3_BUCKET, Key=f'{CTMS_VIEW_QUERY_S3_PATH}{file_name}')
+        file_content = file_obj['Body'].read().decode('utf-8')
+        # print(file_content)
+        return file_content
+    else:
+        return False
+
+
+def execute_athena_query(sql_query, database, output_location):
+    response = athena_client.start_query_execution(
+        QueryString=sql_query,
+        QueryExecutionContext = {
+            'Database':database
+        },
+        ResultConfiguration = {
+            'OutputLocation':output_location
+        }
+    )
+    return response
+
+def has_athena_query_succeeded(query_execution_id):
+    state = "RUNNING"
+    max_execution = 10
+
+    while max_execution > 0 and state in ["RUNNING", "QUEUED"]:
+        max_execution -= 1
+        response = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+        if (
+            "QueryExecution" in response
+            and "Status" in response["QueryExecution"]
+            and "State" in response["QueryExecution"]["Status"]
+        ):
+            state = response["QueryExecution"]["Status"]["State"]
+            if state == "SUCCEEDED":
+                return True
+
+        time.sleep(30)
+
+    return False
+
+
+def copy_files(copy_source, dest_bucket, dest_key):
+    response = s3_client.copy_object(
+        CopySource= copy_source,
+        Bucket= dest_bucket,
+        Key= dest_key
+    )
+
+    return response
+
+
+def ctms_view_query_bronze_to_silver():
+    sql_files_list = get_files()
+    for file in sql_files_list:
+        print(file)
+        sql_view_name = file.split(".")[0]
+        sql_query = get_sql_query(file)
+        if not sql_query:
+            continue
+        ## Run athena query
+        athena_query_res = execute_athena_query(sql_query=sql_query, database=ATHENA_DATABASE, output_location=f's3://{S3_BUCKET}/{S3_KEY_ATHENA_RESULT}/')
+        print(athena_query_res)
+        if 'QueryExecutionId' in athena_query_res:
+            query_execution_id = athena_query_res['QueryExecutionId']
+            ## check athena query completed
+            athena_query_status = has_athena_query_succeeded(query_execution_id=query_execution_id)
+            if athena_query_status:
+                ## athena query successfully completed , copy the result to specific path
+                copy_source =f'/{S3_BUCKET}/{S3_KEY_ATHENA_RESULT}/{query_execution_id}.csv'
+                dest_bucket = S3_BUCKET
+                dest_key = f'{CTMS_VIEW_QUERY_RESULT_S3_PATH}/{sql_view_name}/{sql_view_name}.csv'
+                copy_file_res = copy_files(copy_source, dest_bucket, dest_key)
+                print(copy_file_res)
+
+def call_crawler_if_silver_table_not_exist():
+    tables_avilable = check_is_glue_catalog_tables_exist(GILDA_SILVER_DB)
+    if tables_avilable:
+        print(f'Tables already available in the aws glue catalog db {GILDA_SILVER_DB}')
+        return False
+    else:
+        print(f'Tables are not available in the aws glue catalog db {GILDA_SILVER_DB} Run the crawler')
+        crawler_res = run_crawler(GILDA_SILVER_CRAWLER)
+        return True
+
+def get_account_id():
+    sts_client = boto3.client("sts")
+    account_id = sts_client.get_caller_identity()["Account"]
+    return account_id
+
+def get_sfn_arn():
+    account_id = get_account_id()
+    sfn_arn = f"arn:aws:states:us-west-2:{account_id}:stateMachine:gilda_ctms_view_pg_state_machine"
+    return sfn_arn
+
+### EMR
+## variables
+emr_logs_s3_bucket = f"gilead-ds-emr-logs-{ENV}"
+
+Ec2SubnetId = {
+    "sbx":"subnet-0e146a6bf6d7d94d4",
+    "dev":"subnet-02d23709cbedb4333",
+    "prd":"subnet-0922202ccba53bc9e"
+}
+
+vpc_security_group_id = {
+    "sbx":["sg-0d5fdd4718b9ce889"],
+    "dev":["sg-00e01afdd18c5f171"],
+    "tst":["sg-0afeb5e31f7fc2e96"],
+    "prd":["sg-0afeb5e31f7fc2e96", "sg-00bf14773fc9484d0"],
+}
+
+Ec2KeyName = {
+    "sbx":"ETMF-INGEST-WEST-2",
+    "dev":"gilead_gilda_ds_airflow_emr",
+    "prd":"gilead_gilda_ds_airflow_emr"
+}
+
+JobFlowRole = {
+    "sbx":"AmazonEMR-InstanceProfile-20230405T134725",
+    "dev":"GileadDS-AmazonEMR-InstanceProfile",
+    "prd":"GileadDS-AmazonEMR-InstanceProfile"
+}
+
+ServiceRole = {
+    "sbx":"emr-access",
+    "dev":"gilead_ds_emr_access",
+    "prd":"gilead_ds_emr_access"
+}
+
+## DAG will run daily morning 1 am (pst)
+sinterval =  None
+if ENV =='prd':
+    sinterval = '0 8 * * * '
+elif ENV =='dev':
+    sinterval = None
+else:
+    sinterval = None
+
+## DAG
+with DAG(dag_id=DAG_ID,
+         start_date=datetime(2024,1,1),
+         schedule_interval=sinterval,
+         catchup=False) as dag:
+
+    SPARK_STEPS = [
+        {
+            "Name": "pyspark_ingest",
+            "ActionOnFailure": "CONTINUE",
+            "HadoopJarStep": {
+                "Jar": "command-runner.jar",
+
+                "Args": [
+                    "spark-submit",
+                    f"s3://gilead-ds-mwaa-airflow-lakebound-{ENV}/emr-jobs/gilead_ds_gilda_data_fetch.py",
+                    "--env", ENV,
+                ],
+            },
+        }
+    ]
+
+    JOB_FLOW_OVERRIDES = {
+        "Name": "airflow-emr-oracle-gilda",
+        "LogUri": f"s3://{emr_logs_s3_bucket}/",
+        "ReleaseLabel": "emr-7.1.0",
+        "Applications": [{"Name": "Spark"}],
+        "Configurations":[
+            {
+                "Classification": "hadoop-env",
+                "Configurations": [
+                    {
+                        "Classification": "export",
+                        "Configurations":[],
+                        "Properties": {
+                            "JAVA_HOME": "/usr/lib/jvm/java-17-amazon-corretto.x86_64",
+                            "spark.executor.memory": "12g",
+                            "spark.driver.memory": "12g",
+                            "spark.driver.maxResultSize": "10g",
+                            "spark.executor.memoryOverhead": "6g",
+                        }
+                    }
+                ],
+                "Properties":{}
+            },
+            {
+                "Classification": "spark-env",
+                "Configurations": [
+                    {
+                        "Classification": "export",
+                        "Configurations":[],
+                        "Properties": {
+                            "JAVA_HOME": "/usr/lib/jvm/java-17-amazon-corretto.x86_64",
+                            "spark.executor.memory": "12g",
+                            "spark.driver.memory": "12g",
+                            "spark.driver.maxResultSize": "10g",
+                            "spark.executor.memoryOverhead": "6g",
+                        }
+                    }
+                ],
+                "Properties":{}
+            },
+            {
+                "Classification": "spark-defaults",
+                "Properties": {
+                    "spark.emr-serverless.driverEnv.JAVA_HOME" : "/usr/lib/jvm/java-17-amazon-corretto.x86_64/",
+                    "spark.executorEnv.JAVA_HOME": "/usr/lib/jvm/java-17-amazon-corretto.x86_64",
+                    "spark.executor.memory": "12g",
+                    "spark.driver.memory": "12g",
+                    "spark.driver.maxResultSize": "10g",
+                    "spark.executorver.memoryOverhead": "6g",
+
+                }
+            }
+
+        ],
+        "Instances": {
+            'InstanceGroups': [
+                {
+                    'Name': 'Master Instance Group',
+                    'Market': 'ON_DEMAND',
+                    'InstanceRole': 'MASTER',
+                    'InstanceType': 'm5.2xlarge',
+                    'InstanceCount': 1
+                },
+                {
+                    'Name': 'Core Instance Group',
+                    'Market': 'ON_DEMAND',
+                    'InstanceRole': 'CORE',
+                    'InstanceType': 'm5.2xlarge',
+                    'InstanceCount': 1
+                }
+            ],
+            "KeepJobFlowAliveWhenNoSteps": True,
+            "TerminationProtected": False,
+            'Ec2KeyName': Ec2KeyName[ENV], #'gilead_gilda_ds_airflow_emr', #'ETMF-INGEST-WEST-2',
+            'Ec2SubnetId': Ec2SubnetId[ENV], #'subnet-0e146a6bf6d7d94d4',
+            'AdditionalMasterSecurityGroups':vpc_security_group_id[ENV], #["sg-0d5fdd4718b9ce889"],
+            'AdditionalSlaveSecurityGroups':vpc_security_group_id[ENV], #["sg-0d5fdd4718b9ce889"],
+        },
+        "BootstrapActions":[
+            {
+                'Name':'oracleclient_load',
+                'ScriptBootstrapAction':{
+                    'Path':f"s3://gilead-ds-mwaa-airflow-lakebound-{ENV}/emr-jobs/emr_startup_script.sh"
+                }
+            }
+        ],
+        # "Steps": SPARK_STEPS,
+        "JobFlowRole": JobFlowRole[ENV], ##"GileadDS-AmazonEMR-InstanceProfile",
+        "ServiceRole": ServiceRole[ENV], ##"gilead_ds_emr_access",
+        "EbsRootVolumeSize": 15,
+        'VisibleToAllUsers': True
+    }
+
+    create_emr_cluster = EmrCreateJobFlowOperator(
+        task_id="create_emr_cluster",
+        job_flow_overrides=JOB_FLOW_OVERRIDES,
+    )
+
+    check_emr_cluster_waiting = EmrJobFlowSensor(
+        task_id="check_emr_cluster_waiting",
+        job_flow_id=create_emr_cluster.output,
+        target_states=["RUNNING", "WAITING"],
+        failed_states=["TERMINATED_WITH_ERRORS"],
+        max_attempts=60,
+        poke_interval=60
+    )
+
+    submit_gilda_import_pyspark_job = EmrAddStepsOperator(
+        task_id="submit_gilda_import_pyspark_job",
+        job_flow_id=create_emr_cluster.output,
+        steps=SPARK_STEPS,
+        # execution_role_arn=execution_role_arn,
+    )
+
+    wait_gilda_import_completion = EmrStepSensor(
+        task_id="wait_gilda_import_completion",
+        job_flow_id=create_emr_cluster.output,
+        step_id="{{ task_instance.xcom_pull('submit_gilda_import_pyspark_job', key='return_value')[0] }}",
+    )
+
+    terminate_emr_cluster = EmrTerminateJobFlowOperator(
+        task_id="terminate_emr_cluster",
+        job_flow_id=create_emr_cluster.output,
+    )
+
+    check_emr_cluster_terminated = EmrJobFlowSensor(
+        task_id="check_emr_cluster_terminated",
+        job_flow_id=create_emr_cluster.output,
+        target_states= ["TERMINATED"],
+        failed_states=["TERMINATED_WITH_ERRORS"],
+        max_attempts=60,
+        poke_interval=60
+    )
+
+    call_crawler_if_bronze_table_not_exist = PythonOperator(
+        task_id ='call_crawler_if_bronze_table_not_exist',
+        python_callable=call_crawler_if_bronze_table_not_exist,
+        provide_context=True,
+    )
+    ctms_view_query_bronze_to_silver = PythonOperator(
+        task_id ='ctms_view_query_bronze_to_silver',
+        python_callable=ctms_view_query_bronze_to_silver,
+        provide_context=True,
+    )
+    call_crawler_if_silver_table_not_exist = PythonOperator(
+        task_id ='call_crawler_if_silver_table_not_exist',
+        python_callable=call_crawler_if_silver_table_not_exist,
+        provide_context=True,
+    )
+
+    ctms_view_sync_pg_sfn_start_execution = StepFunctionStartExecutionOperator(
+        task_id="ctms_view_sync_pg_sfn_start_execution", state_machine_arn=get_sfn_arn()
+    )
+
+    sfn_execution_arn = ctms_view_sync_pg_sfn_start_execution.output
+    ctms_view_sync_pg_sfn_wait_for_execution = StepFunctionExecutionSensor(
+         task_id = "ctms_view_sync_pg_sfn_wait_for_execution", execution_arn=sfn_execution_arn
+    )
+
+    chain(
+        create_emr_cluster,
+        check_emr_cluster_waiting,
+        submit_gilda_import_pyspark_job,
+        wait_gilda_import_completion,
+        terminate_emr_cluster,
+        check_emr_cluster_terminated,
+        call_crawler_if_bronze_table_not_exist,
+        ctms_view_query_bronze_to_silver,
+        call_crawler_if_silver_table_not_exist,
+        ctms_view_sync_pg_sfn_start_execution,
+        ctms_view_sync_pg_sfn_wait_for_execution
+
+    )
+	
+RAJU
+
+from airflow import DAG
+
+from airflow.models import Variable
+
+from datetime import datetime, timedelta
+
+from airflow.operators.python import PythonOperator
+
+from airflow.providers.amazon.aws.operators.sns import SnsPublishOperator
+
+from airflow.providers.amazon.aws.operators.emr import (
+
+    EmrCreateJobFlowOperator,
+
+    # EmrTerminateClusterOperator,
+
+    EmrTerminateJobFlowOperator,
+
+    EmrAddStepsOperator,
+
+)
+
+import time
+
+from io import StringIO
+
+import smtplib
+
+from email.mime.text import MIMEText
+
+from email.mime.multipart import MIMEMultipart
+
+# from pyspark.sql import SparkSession
+
+import psycopg2
+
+from psycopg2 import sql
+
+from sqlalchemy import create_engine
+
+from botocore.exceptions import BotoCoreError, ClientError
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from airflow.utils.email import send_email
+
+from airflow.providers.amazon.aws.sensors.emr import (
+
+    EmrJobFlowSensor,
+
+    EmrStepSensor,
+
+)
+
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+from airflow.providers.amazon.aws.hooks.secrets_manager import SecretsManagerHook
+
+import boto3
+
+import zipfile
+
+import base64
+
+import logging
+
+import stat
+
+import pytz
+
+import s3fs
+
+import paramiko
+
+import os
+
+import io
+
+import json
+
+import traceback
+
+import pandas as pd
+
+ 
+
+ 
+
+ 
+
+# Initialize logger
+
+logger = logging.getLogger('gilead_gplan_sftp_etl')
+
+logger.setLevel(logging.INFO)
+
+ 
+
+# Environment variable to enable XCom pickling
+
+os.environ['AIRFLOW__CORE__ENABLE_XCOM_PICKLING'] = 'True'
+
+ 
+
+# Function to fetch secrets from AWS Secrets Manager
+
+def fetch_secret(secret_name, **kwargs):
+
+    region_name = "us-west-2"
+
+    client = boto3.client('secretsmanager', region_name=region_name)
+
+    try:
+
+        logger.info(f"Fetching secret: {secret_name}")
+
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+
+        secret = get_secret_value_response['SecretString']
+
+        kwargs['ti'].xcom_push(key='secret_data', value=secret)
+
+        # print("the values of sftp is here:",sftpsecretshere)
+
+        return secret
+
+    except ClientError as e:
+
+        logger.error(f"Error fetching secret {secret_name}: {str(e)}")
+
+        logger.error(traceback.format_exc())
+
+        raise e
+
+    except Exception as e:
+
+        logger.error(f"Unexpected error: {str(e)}")
+
+        logger.error(traceback.format_exc())
+
+        raise e
+
+ 
+
+def get_sftp_connection_info(**kwargs):
+
+    secrets = json.loads(kwargs['ti'].xcom_pull(task_ids='fetch_secrets', key='secret_data'))
+
+    print("sftpgetconnection details here:", secrets)
+
+    SFTP_HOST = secrets.get("sftp_host", "45.92.53.2")
+
+    SFTP_USERNAME = secrets.get("sftp_username", "interface")
+
+    SFTP_PORT = int(secrets.get("sftp_port", 2863))
+
+    private_key = secrets.get("private_key")
+
+    known_hosts_content = secrets.get("known_hosts")
+
+ 
+
+    logger.info(f"SFTP connection details: host={SFTP_HOST}, username={SFTP_USERNAME}, port={SFTP_PORT}")
+
+ 
+
+    # Store the connection info and private key in XCom to be reused in other tasks
+
+    connection_info = {
+
+        'SFTP_HOST': SFTP_HOST,
+
+        'SFTP_USERNAME': SFTP_USERNAME,
+
+        'SFTP_PORT': SFTP_PORT,
+
+        'private_key': private_key,
+
+        'known_hosts_content': known_hosts_content
+
+    }
+
+    kwargs['ti'].xcom_push(key='sftp_connection_info', value=connection_info)
+
+    logger.info("SFTP connection info saved in XCom.")
+
+    # logger.info(f"Directory contents: {connection_info.listdir()}")
+
+ 
+
+def sftp_connect(connection_info):
+
+    SFTP_HOST = connection_info['SFTP_HOST']
+
+    SFTP_USERNAME = connection_info['SFTP_USERNAME']
+
+    SFTP_PORT = connection_info['SFTP_PORT']
+
+    private_key = connection_info['private_key']
+
+    known_hosts_content = connection_info['known_hosts_content']
+
+ 
+
+    known_hosts_path = "/tmp/known_hosts"
+
+    private_key_buffer = io.StringIO(private_key)
+
+    pkey = paramiko.RSAKey.from_private_key(private_key_buffer)
+
+ 
+
+    # Write known_hosts content to file
+
+    with open(known_hosts_path, "w", encoding="utf-8") as kh_f:
+
+        kh_f.write(known_hosts_content)
+
+ 
+
+    client = paramiko.SSHClient()
+
+    client.load_host_keys(known_hosts_path)
+
+    try:
+
+        logger.info(f"Connecting to SFTP server {SFTP_HOST}:{SFTP_PORT} as {SFTP_USERNAME}")
+
+        client.connect(
+
+            hostname=SFTP_HOST,
+
+            username=SFTP_USERNAME,
+
+            port=SFTP_PORT,
+
+            allow_agent=True,
+
+            pkey=pkey,
+
+            disabled_algorithms={"pubkeys": ["rsa-sha2-256", "rsa-sha2-512"]},
+
+        )
+
+        ftp_client = client.open_sftp()
+
+        return ftp_client, client
+
+    except Exception as e:
+
+        logger.error(f"Failed to connect to SFTP server: {e}")
+
+        raise e
+
+ 
+
+def download_file_from_sftp(**kwargs):
+
+    # Pull connection details from XCom
+
+    logger.info("Starting download from SFTP.")
+
+    connection_info = kwargs['ti'].xcom_pull(task_ids='get_sftp_connection_info', key='sftp_connection_info')
+
+   
+
+    if not connection_info:
+
+        logger.error("No SFTP connection details found in XCom.")
+
+        return
+
+   
+
+    # Establish the SFTP connection using the pulled connection info
+
+    try:
+
+        ftp_client, ssh_client = sftp_connect(connection_info)  # Reuse the `sftp_connect` function to establish the connection
+
+    except Exception as e:
+
+        logger.error(f"Failed to establish SFTP connection: {e}")
+
+        return
+
+ 
+
+   
+
+    remote_path = "/"
+
+    BUCKET = "gilead-ds-lakebound-data-store-sbx"
+
+    pst_timezone = pytz.timezone("US/Pacific")
+
+    date_folder = datetime.now(pst_timezone).strftime("%m%d%Y")
+
+    S3_PATH = "bronze/gplan_alt/import/{}/".format(date_folder)
+
+   
+
+    
+
+    logger.info("Starting download from SFTP and upload to S3 process.")
+
+    logger.info(f"Downloading files from {remote_path} to s3://{BUCKET}/{S3_PATH}")
+
+   
+
+    try:
+
+        # List files in the remote directory
+
+        file_list = ftp_client.listdir_attr(remote_path)
+
+       
+
+        if not file_list:
+
+            logger.warning(f"No files exist in remote directory: {remote_path}")
+
+            return
+
+ 
+
+        # Initialize S3 client
+
+        s3_client = boto3.client('s3')
+
+ 
+
+        for file_attr in file_list:
+
+            # Ensure it's a regular file (not a directory)
+
+            if stat.S_ISREG(file_attr.st_mode):
+
+                file_name = file_attr.filename
+
+                remote_file_path = os.path.join(remote_path, file_name)
+
+               
+
+                with io.BytesIO() as buffer:
+
+                    logger.info(f"Downloading {remote_file_path} to memory buffer")
+
+                   
+
+                    # Download the file directly into the buffer
+
+                    ftp_client.getfo(remote_file_path, buffer)
+
+                   
+
+                    # Move buffer to the beginning before reading
+
+                    buffer.seek(0)
+
+ 
+
+                    # Optional: base64 encode the buffer data
+
+                    base64_encoded_data = base64.b64encode(buffer.read()).decode('utf-8')
+
+                    buffer.seek(0)  # Reset the buffer position after reading
+
+ 
+
+                    # Convert base64 back to bytes for upload
+
+                    encoded_buffer = io.BytesIO(base64.b64decode(base64_encoded_data))
+
+                   
+
+                    # Upload to S3
+
+                    s3_key = f"{S3_PATH}{file_name}"
+
+                    s3_client.upload_fileobj(encoded_buffer, BUCKET, s3_key)
+
+                    
+
+                    logger.info(f"Uploaded {remote_file_path} to s3://{BUCKET}/{s3_key}")
+
+    except Exception as e:
+
+        logger.error(f"Error during SFTP to S3 transfer: {str(e)}")
+
+        logger.error(traceback.format_exc())
+
+        raise
+
+    finally:
+
+        # Close SFTP and SSH connections after processing
+
+        ftp_client.close()
+
+        ssh_client.close()
+
+        logger.info("SFTP connection closed.")
+
+ 
+
+       
+
+def send_email_error(sender, recipient, error):
+
+    AWS_REGION = "us-west-2"
+
+    client = boto3.client("ses", region_name=AWS_REGION)
+
+    SUBJECT = "Airflow DAG - Error Notification"
+
+    BODY_TEXT = f"Hello,\nThis is the error message: {error}.\nCheck Airflow logs for more information."
+
+    BODY_HTML = f"<html><body><h1>Error Notification</h1><p>{error}</p></body></html>"
+
+    CHARSET = "UTF-8"
+
+ 
+
+    msg = MIMEMultipart("mixed")
+
+    msg["Subject"] = SUBJECT
+
+    msg["From"] = sender
+
+    msg["To"] = recipient
+
+    msg_body = MIMEMultipart("alternative")
+
+    msg_body.attach(MIMEText(BODY_TEXT, "plain", CHARSET))
+
+    msg_body.attach(MIMEText(BODY_HTML, "html", CHARSET))
+
+    msg.attach(msg_body)
+
+    try:
+
+        client.send_raw_email(
+
+            Source=sender,
+
+            Destinations=[recipient],
+
+            RawMessage={"Data": msg.as_string()}
+
+        )
+
+        logger.info("Error notification email sent successfully.")
+
+    except ClientError as e:
+
+        logger.error(f"Failed to send email: {e.response['Error']['Message']}")
+
+        raise e
+
+ 
+
+def notify_failure(context):
+
+    logger.error("Sending failure notification.")
+
+    error = context.get('exception')
+
+    # send_email_error("Development Systems raju.hanumandla@gilead.com", raju.hanumandla@gilead.com, error=str(error))
+
+ 
+
+ 
+
+## variables for EMR Creation
+
+ENV = Variable.get("ENV")
+
+emr_logs_s3_bucket = f"gilead-ds-emr-logs-{ENV}"
+
+ 
+
+Ec2SubnetId = {
+
+    "sbx":"subnet-0e146a6bf6d7d94d4",
+
+    #"dev":"subnet-02d23709cbedb4333",
+
+    #"prd":"subnet-0922202ccba53bc9e"
+
+}
+
+ 
+
+vpc_security_group_id = {
+
+    "sbx":["sg-0d5fdd4718b9ce889"],
+
+    #"dev":["sg-00e01afdd18c5f171"],
+
+    #"tst":["sg-0afeb5e31f7fc2e96"],
+
+    #"prd":["sg-0afeb5e31f7fc2e96", "sg-00bf14773fc9484d0"],
+
+}
+
+ 
+
+Ec2KeyName = {
+
+    "sbx":"ETMF-INGEST-WEST-2",
+
+    #"dev":"gilead_gilda_ds_airflow_emr",
+
+    #"prd":"gilead_gilda_ds_airflow_emr"
+
+}
+
+ 
+
+JobFlowRole = {
+
+    "sbx":"AmazonEMR-InstanceProfile-20230405T134725",
+
+    #"dev":"GileadDS-AmazonEMR-InstanceProfile",
+
+    #"prd":"GileadDS-AmazonEMR-InstanceProfile"
+
+}
+
+ 
+
+ServiceRole = {
+
+    "sbx":"emr-access",
+
+    #"dev":"gilead_ds_emr_access",
+
+    #"prd":"gilead_ds_emr_access"
+
+}
+
+ 
+
+ 
+
+ 
+
+# Default arguments for the DAG
+
+default_args = {
+
+    'owner': 'airflow',
+
+    'start_date': datetime(2024, 10, 1),
+
+    'depends_on_past': False,
+
+    'email_on_failure': True,
+
+    'on_failure_callback': notify_failure,
+
+    'email_on_retry': False,
+
+    'retries': 0,
+
+    'retry_delay': timedelta(minutes=5),
+
+}
+
+ 
+
+# Define the DAG
+
+with DAG(
+
+    dag_id='gilead_gplan_sftp_test001_dag',
+
+    default_args=default_args,
+
+    schedule_interval=None,
+
+    catchup=False,
+
+) as dag:
+
+ 
+
+    fetch_secret_task = PythonOperator(
+
+        task_id='fetch_secrets',
+
+        python_callable=fetch_secret,
+
+        op_kwargs={'secret_name': 'gplan/sftp/credentials'},
+
+        provide_context=True,
+
+    )
+
+ 
+
+    sftp_connection_task = PythonOperator(
+
+        task_id='get_sftp_connection_info',
+
+        python_callable=get_sftp_connection_info,
+
+        provide_context=True,
+
+    )
+
+ 
+
+    download_file_task = PythonOperator(
+
+        task_id='download_file_from_sftp',
+
+        python_callable=download_file_from_sftp,
+
+        provide_context=True,
+
+    )
+
+ 
+
+    notify_success = SnsPublishOperator(
+
+        task_id='notify_success',
+
+        target_arn='arn:aws:sns:us-west-2:240896563073:gplan_sns_airflow_dag',
+
+        message="All tasks in the Sftp-to-S3-Airflow DAG completed successfully.",
+
+        subject="Airflow Success Notification",
+
+        trigger_rule="all_success",
+
+    )
+
+   
+
+    # Define task dependencies
+
+    fetch_secret_task >> sftp_connection_task >> download_file_task >> notify_success
+
+    #  from here execution of spark steps and EMR  Creation jobs
+
+ 
+
+   
+
+    # Define steps for each file in file_list
+
+    # file_list = [
+
+    #     "activity", "activity_cost_account", "activity_study", "activity_type",
+
+    #     "planned_hour", "project", "resource", "risk", "mitigation_risk",
+
+    #     "version_activity", "version_project"
+
+    # ]
+
+   
+
+    # Define EMR job flow override configuration
+
+    JOB_FLOW_OVERRIDES = {
+
+        "Name": "airflow-emr-oracle-gilda",
+
+        "LogUri": f"s3://{emr_logs_s3_bucket}/",
+
+        "ReleaseLabel": "emr-7.1.0",
+
+        "Applications": [{"Name": "Spark"}],
+
+        "Configurations": [
+
+            {
+
+                "Classification": "hadoop-env",
+
+                "Configurations": [
+
+                    {
+
+                        "Classification": "export",
+
+                        "Configurations": [],
+
+                        "Properties": {
+
+                            "JAVA_HOME": "/usr/lib/jvm/java-17-amazon-corretto.x86_64"
+
+                        }
+
+                    }
+
+                ],
+
+                "Properties": {}
+
+            },
+
+            {
+
+                "Classification": "spark-env",
+
+                "Configurations": [
+
+                    {
+
+                        "Classification": "export",
+
+                        "Configurations": [],
+
+                        "Properties": {
+
+                            "JAVA_HOME": "/usr/lib/jvm/java-17-amazon-corretto.x86_64"
+
+                        }
+
+                    }
+
+                ],
+
+                "Properties": {}
+
+            },
+
+            {
+
+                "Classification": "spark-defaults",
+
+                "Properties": {
+
+                    "spark.emr-serverless.driverEnv.JAVA_HOME": "/usr/lib/jvm/java-17-amazon-corretto.x86_64/",
+
+                    "spark.executorEnv.JAVA_HOME": "/usr/lib/jvm/java-17-amazon-corretto.x86_64",
+
+                    "spark.executor.memory": "12g",
+
+                    "spark.driver.memory": "12g",
+
+                    "spark.executor.memoryOverhead": "6g",
+
+                    "spark.sparkContext.setCheckpointDir": "/tmp/checkpoint",
+
+                    "spark.log4jHotPatch.enabled":"False"
+
+                }
+
+            }
+
+        ],
+
+        "Instances": {
+
+            'InstanceGroups': [
+
+                {
+
+                    'Name': 'Master Instance Group',
+
+                    'Market': 'ON_DEMAND',
+
+                    'InstanceRole': 'MASTER',
+
+                    'InstanceType': 'm5.2xlarge',
+
+                    'InstanceCount': 1
+
+                },
+
+                {
+
+                    'Name': 'Core Instance Group',
+
+                    'Market': 'ON_DEMAND',
+
+                    'InstanceRole': 'CORE',
+
+                    'InstanceType': 'm5.2xlarge',
+
+                    'InstanceCount': 1
+
+                }
+
+            ],
+
+            "KeepJobFlowAliveWhenNoSteps": True,
+
+            "TerminationProtected": False,
+
+            'Ec2KeyName': Ec2KeyName[ENV],
+
+            'Ec2SubnetId': Ec2SubnetId[ENV],
+
+            'AdditionalMasterSecurityGroups': vpc_security_group_id[ENV],
+
+            'AdditionalSlaveSecurityGroups': vpc_security_group_id[ENV],
+
+        },
+
+        "BootstrapActions": [
+
+            {
+
+                'Name': 'oracleclient_load',
+
+                'ScriptBootstrapAction': {
+
+                    'Path': f"s3://gilead-ds-mwaa-airflow-lakebound-{ENV}/emr-jobs/emr_startup_script.sh"
+
+                }
+
+            }
+
+        ],
+
+        "JobFlowRole": JobFlowRole[ENV],
+
+        "ServiceRole": ServiceRole[ENV],
+
+        "EbsRootVolumeSize": 15,
+
+        'VisibleToAllUsers': True
+
+    }
+
+ 
+
+    # Postgres connection details
+
+ 
+
+    # Logging setup
+
+    logger = logging.getLogger(__name__)
+
+ 
+
+    # Configuration parameters
+
+    SECRET_NAME = "gplan/postgres/credentials"
+
+    REGION_NAME = "us-west-2"
+
+    BUCKET = "gilead-ds-lakebound-data-store-sbx"
+
+    PREFIX = 'silver/gplan_alt/import'
+
+    pst_timezone = pytz.timezone("US/Pacific")
+
+    date_folder = datetime.now(pst_timezone).strftime("%m%d%Y")
+
+ 
+
+            # AWS and Postgres Configuration
+
+    GLUE_DATABASE_NAME = "gilda_gplan_ds_inbound_silver"
+
+    GLUE_CRAWLER_NAME = "gilda_gplan_inbound_crawler_silver"
+
+    REGION_NAME = "us-west-2"
+
+    BUCKET = "gilead-ds-lakebound-data-store-sbx"
+
+    JSON_FILE_PATH = "artifacts/gplan_alt/gplanfilelist.json"
+
+    PREFIX = 'silver/gplan_alt'
+
+    SECRET_NAME = "gplan/postgres/credentials"
+
+    pst_timezone = pytz.timezone("US/Pacific")
+
+    date_folder = datetime.now(pst_timezone).strftime("%m%d%Y")
+
+    Schema_name = "gplan_alt"
+
+ 
+
+    shared_data = {}
+
+    def read_file_list_from_s3(bucket_name, key, **kwargs):
+
+        s3_client = boto3.client('s3')
+
+        response = s3_client.get_object(Bucket=bucket_name, Key=key)
+
+        content = response['Body'].read().decode('utf-8')
+
+        file_list = json.loads(content)['file_list']
+
+        # config=  json.loads(content)
+
+        # print (config)
+
+        print(f"file_list: {file_list}")
+
+        shared_data['file_list'] = file_list
+
+        if 'ti' in kwargs:
+
+             kwargs['ti'].xcom_push(key='file_list', value=file_list)
+
+        return file_list
+
+ 
+
+    def another_function ():
+
+        global file_list
+
+        print(f"print the file list : {file_list}")
+
+    # Fetch PostgreSQL credentials
+
+    def get_postgres_credentials(secret_name, **kwargs):
+
+        client = boto3.client("secretsmanager", region_name=REGION_NAME)
+
+        try:
+
+            response = client.get_secret_value(SecretId=secret_name)
+
+            if 'SecretString' in response:
+
+                credentials = json.loads(response['SecretString'])
+
+                # print(credentials)
+
+                kwargs['ti'].xcom_push(key="postgres_credentials", value=credentials)
+
+                print("successfully pushed postgres credentials")
+
+            else:
+
+                raise ValueError("SecretString not found in Secrets Manager response")
+
+        except Exception as e:
+
+            print(f"Error retrieving secret: {e}")
+
+            raise
+
+    def create_glue_database():
+
+        glue_client = boto3.client('glue', region_name=REGION_NAME)
+
+        try:
+
+            glue_client.create_database(
+
+                DatabaseInput={
+
+                'Name': GLUE_DATABASE_NAME,
+
+                'Description': 'Database for storing ETL data cataloged by AWS Glue Crawler'
+
+                }
+
+            )
+
+            print(f"Glue database '{GLUE_DATABASE_NAME}' created.")
+
+        except glue_client.exceptions.AlreadyExistsException:
+
+            print(f"Glue database '{GLUE_DATABASE_NAME}' already exists.")
+
+ 
+
+    def wait_for_crawler_to_be_ready(crawler_name):
+
+        glue_client = boto3.client('glue', region_name=REGION_NAME)
+
+        while True:
+
+            response = glue_client.get_crawler(Name=crawler_name)
+
+            state = response['Crawler']['State']
+
+            if state == 'READY':
+
+                print(f"Crawler '{crawler_name}' is ready.")
+
+                break
+
+            print(f"Crawler '{crawler_name}' is still running. Waiting...")
+
+            time.sleep(10)
+
+ 
+
+    def compare_and_sync_glue_postgres_tables(file_list, database_name, region_name, **kwargs):
+
+        
+
+        glue_client = boto3.client('glue', region_name=REGION_NAME)
+
+        ti = kwargs['ti']
+
+ 
+
+        # Fetch PostgreSQL credentials from XCom
+
+        conn_details = ti.xcom_pull(task_ids='fetch_postgres_credentials', key='postgres_credentials')
+
+        glue_table_names = []
+
+        try:
+
+            paginator = glue_client.get_paginator('get_tables')
+
+            for page in paginator.paginate(DatabaseName=database_name):
+
+                for table in page['TableList']:
+
+                    glue_table_names.append(table['Name'].lower())
+
+            logging.info(f"Tables in Glue Database: {glue_table_names}")
+
+        except Exception as e:
+
+            logging.error(f"Error retrieving Glue table names: {e}")
+
+            raise
+
+ 
+
+        postgres_table_name = []
+
+        # print(postgres_table_name)
+
+       
+
+        conn = psycopg2.connect(
+
+            dbname=conn_details['dbname'],
+
+            user=conn_details['username'],
+
+            password=conn_details['password'],
+
+            host=conn_details['host'],
+
+            port=conn_details['port']
+
+        )
+
+        # print(conn)
+
+        cursor = conn.cursor()
+
+       
+
+        glue_response = glue_client.get_tables(DatabaseName=database_name)
+
+        glue_tables = glue_response.get('TableList', [])
+
+        glue_table_names = {table['Name'].lower() for table in glue_tables}
+
+        # print(glue_table_names)
+
+ 
+
+        try:
+
+            for table in glue_tables:
+
+                glue_table_name = table['Name'].lower()
+
+                postgres_table_name = f"{glue_table_name}_raw"  # Add '_raw' suffix for PostgreSQL table
+
+ 
+
+                # Fetch Glue table columns
+
+                glue_columns = {
+
+                    col['Name'].lower(): col['Type'].upper() for col in table['StorageDescriptor']['Columns']
+
+                }
+
+                logging.info(f"Glue columns for table '{glue_table_name}': {glue_columns}")
+
+                logging.info(f"postgres  columns of  table '{postgres_table_name}'")
+
+ 
+
+                # Step 1: Check if table exists in PostgreSQL
+
+                cursor.execute("""
+
+                    SELECT EXISTS (
+
+                        SELECT 1
+
+                        FROM information_schema.tables
+
+                        WHERE table_name = %s AND table_schema= 'gplan_alt'
+
+                    )
+
+                """, (postgres_table_name,))
+
+                table_exists = cursor.fetchone()[0]
+
+                # print(f"here we are getting the tables:{table_exists}")
+
+ 
+
+                # Step 2: If table does not exist, create it
+
+                if not table_exists:
+
+                    logging.info(f"Table '{postgres_table_name}' does not exist. Creating table.")
+
+                    column_definitions = ", ".join(
+
+                        f"{sql.Identifier(name).as_string(conn)} {map_glue_to_postgres_type(data_type)}"
+
+                        for name, data_type in glue_columns.items()
+
+                    )
+
+                    create_table_query = f"""
+
+                        CREATE TABLE {Schema_name}.{postgres_table_name} ({column_definitions});
+
+                    """
+
+                    logging.info(f"Executing query: {create_table_query}")
+
+                    cursor.execute(create_table_query)
+
+                    conn.commit()
+
+                    logging.info(f"Table '{postgres_table_name}' created successfully.")
+
+                    continue  # Move to the next table since it has been created
+
+                else:
+
+                    logging.info(f"Table '{postgres_table_name}' already exists.")
+
+                if table_exists: 
+
+                # Step 3: Fetch existing PostgreSQL table columns
+
+                    cursor.execute("""
+
+                        SELECT column_name
+
+                        FROM information_schema.columns
+
+                        WHERE table_name = %s AND table_schema= 'gplan_alt'
+
+                    """, (postgres_table_name,))
+
+                    postgres_columns = {row[0].lower() for row in cursor.fetchall()}
+
+                    logging.info(f"PostgreSQL columns for table '{postgres_table_name}': {postgres_columns}")
+
+ 
+
+                    # Step 4: Identify and add new columns
+
+                    new_columns = {col: glue_columns[col] for col in glue_columns if col not in postgres_columns}
+
+                    if new_columns:
+
+                        logging.info(f"New columns to add for table '{postgres_table_name}': {new_columns}")
+
+                        for column_name, column_type in new_columns.items():
+
+                            column_type_sql = map_glue_to_postgres_type(column_type)  # Map Glue type to PostgreSQL type
+
+                            alter_query = sql.SQL(
+
+                                "ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS {} {};").format(
+
+                                    sql.Identifier("gplan_alt"),
+
+                                    sql.Identifier(postgres_table_name),
+
+                                    sql.Identifier(column_name.lower()),
+
+                                    sql.SQL(column_type_sql)
+
+                                )
+
+                            logging.info(f"Executing query: {alter_query.as_string(conn)}")
+
+                            cursor.execute(alter_query)
+
+                        conn.commit()
+
+                        logging.info(f"Table '{postgres_table_name}' updated with new columns.")
+
+                else:
+
+                    logging.info(f"No new columns to add for table '{postgres_table_name}'.")
+
+ 
+
+        except Exception as e:
+
+            logging.error(f"Error during table verification or update: {str(e)}")
+
+            conn.rollback()
+
+            raise
+
+        finally:
+
+            cursor.close()
+
+            conn.close()
+
+            logging.info("PostgreSQL connection closed.")
+
+ 
+
+        return glue_table_names
+
+ 
+
+    def map_glue_to_postgres_type(glue_type):
+
+   
+
+        type_mapping = {
+
+            "STRING": "TEXT",
+
+            "INT": "INTEGER",
+
+            "BIGINT": "BIGINT",
+
+            "DOUBLE": "DOUBLE PRECISION",
+
+            "BOOLEAN": "BOOLEAN",
+
+            "TIMESTAMP": "TIMESTAMP",
+
+            "FLOAT": "REAL",
+
+            "DATE": "DATE"
+
+        }
+
+        return type_mapping.get(glue_type.upper(), "TEXT")
+
+ 
+
+    def run_glue_crawler(crawler_name, database_name,  s3_path):
+
+        glue_client = boto3.client('glue', region_name=REGION_NAME)
+
+        wait_for_crawler_to_be_ready(crawler_name)
+
+        try:
+
+            glue_client.update_crawler(
+
+                Name=crawler_name,
+
+                Role="gilead_ds_mwaa_airflow_iam_role",
+
+                DatabaseName=database_name,
+
+                Targets={"S3Targets": [{"Path": s3_path}]}
+
+            )
+
+            glue_client.start_crawler(Name=crawler_name)
+
+            while True:
+
+                response = glue_client.get_crawler(Name=crawler_name)
+
+                state = response['Crawler']['State']
+
+                if state == 'READY':
+
+                    print(f"Crawler '{crawler_name}' completed for path: {s3_path}")
+
+                    break
+
+                time.sleep(10)
+
+        except Exception as e:
+
+            print(f"Error starting or updating crawler '{crawler_name}': {e}")
+
+           
+
+ 
+
+       
+
+    def retrieve_tables_from_catalog(database_name, region_name):
+
+        glue_client = boto3.client('glue', region_name=region_name)
+
+        table_names = []
+
+        try:
+
+            paginator = glue_client.get_paginator('get_tables')
+
+            page_iterator = paginator.paginate(DatabaseName=database_name)
+
+           
+
+            for page in page_iterator:
+
+                for table in page['TableList']:
+
+                    table_names.append(table['Name'])
+
+                   
+
+            logging.info(f"Retrieved tables: {table_names}")
+
+        except glue_client.exceptions.EntityNotFoundException:
+
+            logging.error(f"Database {database_name} not found.")
+
+        except Exception as e:
+
+            logging.error(f"Error retrieving tables from Glue catalog: {e}")
+
+       
+
+        return table_names
+
+ 
+
+    def load_data_to_postgres(database_name, **kwargs):
+
+        ti = kwargs['ti']
+
+        conn_details = ti.xcom_pull(task_ids='fetch_postgres_credentials', key='postgres_credentials')
+
+        file_list = ti.xcom_pull(task_ids='read_file_list', key='file_list')
+
+       
+
+        if not file_list:
+
+            raise ValueError("file_list is empty or missing from XCom.")
+
+       
+
+        # unique_table =set(file_list)
+
+        connection_string = f"postgresql+psycopg2://{conn_details['username']}:{conn_details['password']}@{conn_details['host']}:{conn_details['port']}/{conn_details['dbname']}"
+
+        engine = create_engine(connection_string)
+
+        glue_client = boto3.client('glue', region_name="us-west-2")
+
+        try:
+
+            with engine.connect() as connection:# try:
+
+                # Retrieve table names from Glue catalog
+
+                table_list = retrieve_tables_from_catalog(database_name, REGION_NAME)
+
+                if not table_list:
+
+                    logging.error(f"No tables found to process for database: {database_name}")
+
+                    # continue
+
+                    return
+
+ 
+
+                for table_name in table_list:
+
+                    logging.info(f"Processing table: {table_name}")
+
+                    try:
+
+                        # Truncate the existing raw table in PostgreSQL
+
+                        connection.execute(f"TRUNCATE TABLE {Schema_name}.{table_name.lower()}_raw;")
+
+                        logging.info(f"Table {Schema_name}.{table_name.lower()}_raw truncated")
+
+ 
+
+                        # Fetch the S3 location for the table from Glue catalog
+
+                        response = glue_client.get_table(DatabaseName=database_name, Name=table_name)
+
+                        s3_path = response['Table']['StorageDescriptor']['Location']
+
+                       
+
+                        # Extract bucket name and prefix from the S3 path
+
+                        s3_client = boto3.client('s3', region_name="us-west-2")
+
+                        bucket_name = s3_path.split('/')[2]
+
+                        prefix = '/'.join(s3_path.split('/')[3:])
+
+                       
+
+                        # List objects in S3 under the prefix (parquet files)
+
+                        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+
+                        tables = f"{table_name.lower()}_raw"
+
+                       
+
+                        parquet_files = [obj['Key'] for obj in response.get('Contents', []) if obj['Key'].endswith('.parquet')]
+
+                        dataframes = []
+
+ 
+
+                        for file_key in parquet_files:
+
+                            obj = s3_client.get_object(Bucket=bucket_name, Key=file_key)
+
+                            df = pd.read_parquet(io.BytesIO(obj['Body'].read()))
+
+                            dataframes.append(df)
+
+ 
+
+                        # Concatenate dataframes if any parquet files were found
+
+                        if dataframes:
+
+                            combined_df = pd.concat(dataframes, ignore_index=True)
+
+                            if isinstance(combined_df, pd.DataFrame):
+
+                                csv_buffer = StringIO()
+
+                                combined_df.to_csv(csv_buffer, index=False)
+
+                                csv_buffer.seek(0)
+
+ 
+
+                                # Load CSV data into PostgreSQL using COPY command
+
+                                with connection.begin() as transaction:
+
+                                    try:
+
+                                        cursor = connection.connection.cursor()
+
+                                        cursor.copy_expert(f"COPY {Schema_name}.{tables} FROM STDIN WITH CSV HEADER", csv_buffer)
+
+                                        logging.info(f"Data loaded into PostgreSQL table: {tables}")
+
+                                    except Exception as e:
+
+                                        transaction.rollback()
+
+                                        logging.error(f"Error loading data into PostgreSQL table {tables}: {e}")
+
+                    except Exception as e:
+
+                        logging.error(f"Failed to process table {table_name}: {e}")
+
+        except Exception as e:
+
+            logging.error(f"Failed to retrieve tables from catalog: {e}")
+
+        finally:
+
+            engine.dispose()
+
+ 
+
+ 
+
+    get_postgres_creds = PythonOperator(
+
+         task_id="fetch_postgres_credentials",
+
+         python_callable=get_postgres_credentials,
+
+         op_kwargs={'secret_name': 'gplan/postgres/credentials'},
+
+         provide_context=True,
+
+     )
+
+   
+
+    # Create EMR cluster
+
+    create_emr = EmrCreateJobFlowOperator(
+
+        task_id="create_emr",
+
+        job_flow_overrides=JOB_FLOW_OVERRIDES,
+
+    )
+
+ 
+
+    # Wait for EMR cluster to be ready
+
+    check_emr_waiting = EmrJobFlowSensor(
+
+        task_id="check_emr_waiting",
+
+        job_flow_id=create_emr.output,
+
+        target_states=["RUNNING", "WAITING"],
+
+        failed_states=["TERMINATED_WITH_ERRORS"],
+
+        max_attempts=60,
+
+        poke_interval=60,
+
+        on_failure_callback=notify_failure
+
+    )
+
+ 
+
+    # Track EMR steps and PostgreSQL load tasks in lists
+
+    completion_sensors = []
+
+    load_to_postgres_tasks = []
+
+    # file_list = read_file_list_from_s3(bucket_name='gilead-ds-lakebound-data-store-sbx', key=JSON_FILE_PATH)
+
+    file_list = [
+
+       "activity", "activity_cost_account", "activity_study", "activity_type",
+
+        "planned_hour", "project", "resource", "risk", "mitigation_risk",
+
+        "version_activity", "version_project","asset","baseline","bp","cost_account","planned_hour_risk_adjusted","planned_expenditure","product"
+
+    ]
+
+    # def generate_spark_tasks(bucket_name,key, **kwargs):
+
+       
+
+    #     # ti = kwargs['ti']
+
+    #     # config = ti.xcom_pull(task_ids="read_file_list", key="file_list")
+
+    #     # if not isinstance(config, dict):
+
+    #     #     raise ValueError("config from xcom is not dict, ensure it is properly formated")
+
+    #     file_list = shared_data.get('file_list',[])
+
+    #     if not file_list:
+
+    #         raise ValueError("file list is empty")
+
+    #     print(f"pritgng the filelist: {file_list}")
+
+        # Define steps for each file
+
+    for file_name in file_list:
+
+        # print(f"pritinigng the filelist: {file_name}")
+
+        spark_step = {
+
+            "Name": f"s3_bronze_to_s3_silver_{file_name}",
+
+            "ActionOnFailure": "CONTINUE",
+
+            "HadoopJarStep": {
+
+                "Jar": "command-runner.jar",
+
+                "Args": [
+
+                    "spark-submit",
+
+                    f"s3://gilead-ds-mwaa-airflow-lakebound-{ENV}/emr-jobs/gplan_testl_01.py",
+
+                    "--file-name", file_name,
+
+                    "--BUCKET", "gilead-ds-lakebound-data-store-sbx",
+
+                    # "--env", ENV,
+
+                ],
+
+            },
+
+        }
+
+        # print(f"generated spark step : {spark_step}")
+
+ 
+
+        # Submit Spark job step for the current file
+
+        submit_pyspark_job = EmrAddStepsOperator(
+
+            task_id=f"submit_pyspark_job_{file_name}",
+
+            job_flow_id=create_emr.output,
+
+            steps=[spark_step],
+
+            start_date=default_args['start_date'],
+
+            on_failure_callback=notify_failure,
+
+            dag=dag
+
+        )
+
+        # submit_pyspark_job.execute(context=kwargs)
+
+        # print(f"printing the spark step of file : {file_name}")
+
+ 
+
+        # Monitor completion of the Spark job step
+
+        wait_pyspark_completion = EmrStepSensor(
+
+            task_id=f"wait_pyspark_completion_{file_name}",
+
+            job_flow_id=create_emr.output,
+
+            start_date=default_args['start_date'],
+
+            step_id="{{ task_instance.xcom_pull(task_ids='submit_pyspark_job_"+ file_name + "', key='return_value')[0] }}",
+
+            on_failure_callback=notify_failure,
+
+            dag=dag
+
+        )
+
+        # wait_pyspark_completion.execute(context=kwargs)
+
+        # print(f"printing the spark step of file : {file_name}")
+
+ 
+
+        # Create a task to load data into PostgreSQL
+
+        # load_data_task = PythonOperator(
+
+        #     task_id=f"load_{file_name}_to_postgres",
+
+        #     python_callable=load_data_to_postgres,
+
+        #     op_kwargs={
+
+        #         'file_name': file_name,
+
+        #         'BUCKET': 'gilead-ds-lakebound-data-store-sbx',
+
+        #         'database_name': GLUE_DATABASE_NAME,
+
+        #         'postgres_credentials': "{{ task_instance.xcom_pull(task_ids='get_postgres_creds') }}"
+
+        #     },
+
+        #     start_date=default_args['start_date'],
+
+        #     provide_context=True,
+
+        #     dag=dag
+
+        # )
+
+       
+
+        # Track completion sensor
+
+        completion_sensors.append(wait_pyspark_completion)
+
+        # load_to_postgres_tasks.append(load_data_task)
+
+ 
+
+        # Set dependencies
+
+        create_emr >> check_emr_waiting >> submit_pyspark_job >> wait_pyspark_completion
+
+ 
+
+    load_data_to_postgres_task = PythonOperator(
+
+        task_id="load_data_to_postgres",
+
+        python_callable=load_data_to_postgres,
+
+        op_kwargs={"database_name": GLUE_DATABASE_NAME},
+
+        on_failure_callback=notify_failure,
+
+        provide_context=True,
+
+    )
+
+   
+
+    create_glue_database_task = PythonOperator(
+
+        task_id="create_glue_database",
+
+        python_callable=create_glue_database
+
+    )
+
+    read_file_list_task = PythonOperator(
+
+        task_id="read_file_list",
+
+        python_callable=read_file_list_from_s3,
+
+        op_kwargs={
+
+            "bucket_name": "gilead-ds-lakebound-data-store-sbx",
+
+            "key": "artifacts/gplan_alt/gplanfilelist.json",
+
+        },
+
+        provide_context=True,
+
+    )
+
+   
+
+    verify_tables_task = PythonOperator(
+
+        task_id="verify_tables_with_glue_catalog",
+
+        python_callable=compare_and_sync_glue_postgres_tables,
+
+        op_kwargs={
+
+            "file_list":"{{task_instance.xcom_pull(task_ids='read_file_list', key='file_list')}}",
+
+            "database_name": GLUE_DATABASE_NAME,
+
+            "region_name": REGION_NAME,
+
+        },
+
+        provide_context=True,
+
+    )
+
+   # generate_spark_tasks_task = PythonOperator(
+
+    #     task_id="generate_spark_tasks",
+
+    #     python_callable=generate_spark_tasks,
+
+    #     op_kwargs={
+
+    #         "bucket_name": "gilead-ds-lakebound-data-store-sbx",
+
+    #         "key": "artifacts/gplan_alt/gplanfilelist.json",
+
+    #     },
+
+    #     on_failure_callback=notify_failure,
+
+    #     provide_context=True
+
+    # )
+
+    glue_crawler_task = PythonOperator(
+
+        task_id="run_crawler_for_files",
+
+        python_callable=run_glue_crawler,
+
+        op_kwargs={
+
+            "crawler_name": "gilda_gplan_inbound_crawler_silver",
+
+            "database_name": "gilda_gplan_ds_inbound_silver",
+
+            # "file_list": file_list,
+
+            "s3_path" : "s3://gilead-ds-lakebound-data-store-sbx/silver/gplan_alt/"
+
+        },
+
+        provide_context= True,
+
+    )
+
+   
+
+    # Terminate EMR cluster
+
+    terminate_emr = EmrTerminateJobFlowOperator(
+
+        task_id="terminate_emr",
+
+        job_flow_id=create_emr.output,
+
+        on_failure_callback=notify_failure
+
+    )
+
+ 
+
+    # Wait for termination to complete
+
+    check_emr_terminated = EmrJobFlowSensor(
+
+        task_id="check_emr_terminated",
+
+        job_flow_id=create_emr.output,
+
+        target_states=["TERMINATED"],
+
+        failed_states=["TERMINATED_WITH_ERRORS"],
+
+        max_attempts=60,
+
+        poke_interval=60,
+
+        on_failure_callback=notify_failure
+
+    )
+
+ 
+
+    # Set termination dependencies for each completion sensor   >>generate_spark_tasks_task
+
+    for sensor in completion_sensors:
+
+        sensor >> terminate_emr
+
+#
+
+    create_glue_database_task >> read_file_list_task >>get_postgres_creds>> verify_tables_task >> glue_crawler_task
+
+    create_emr >> check_emr_waiting >>load_data_to_postgres_task>>terminate_emr >> check_emr_terminated
+
+               
+
+===========================================================
+
+### Read data from SQLserver to s3 through Stepfunction and glue
+
+### s3 bronze to silver through airflow
+
+import json
+
+from datetime import datetime
+
+import os
+
+ 
+
+from airflow import DAG
+
+from airflow.decorators import task
+
+from airflow.models.baseoperator import chain
+
+from airflow.providers.amazon.aws.hooks.step_function import StepFunctionHook
+
+from airflow.providers.amazon.aws.operators.step_function import (
+
+    StepFunctionGetExecutionOutputOperator,
+
+    StepFunctionStartExecutionOperator,
+
+)
+
+from airflow.providers.amazon.aws.sensors.step_function import StepFunctionExecutionSensor
+
+ 
+
+from airflow.utils.dates import days_ago
+
+from airflow.decorators import dag,task, task_group
+
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+from airflow.models import Variable
+
+ 
+
+import os
+
+import json
+
+import boto3
+
+from datetime import datetime, timedelta
+
+import time
+
+ 
+
+ 
+
+ENV = Variable.get("ENV")
+
+DAG_ID =  os.path.basename(__file__).replace(".py", "")
+
+ 
+
+s3_client = boto3.client('s3')
+
+athena_client = boto3.client('athena')
+
+s3_hook = S3Hook()
+
+state_machine_arn = 'arn:aws:states:us-west-2:240896563073:stateMachine:gilead-dss-gumi_source_to_s3_sfn'
+
+ 
+
+STATE_MACHINE_DEFINITION = {
+
+    "StartAt": "Wait",
+
+    "States": {"Wait": {"Type": "Wait", "Seconds": 7, "Next": "Success"}, "Success": {"Type": "Succeed"}},
+
+}
+
+ 
+
+ 
+
+S3_BUCKET = f'gilead-ds-lakebound-data-store-{ENV}'
+
+# print('S3_BUCKET: ', S3_BUCKET)
+
+S3_KEY_ATHENA_RESULT ='athena-query-results/airflow'
+
+ATHENA_DATABASE= 'gilead_ds_datalake_gumi_bronze'
+
+VIEW_QUERY_S3_PATH ='artifacts/gumi/view_query/'
+
+VIEW_QUERY_RESULT_S3_PATH = 'silver/gumi'
+
+ 
+
+ 
+
+def get_sql_query(file_name):
+
+    print('filename')
+
+    print(file_name)
+
+    if s3_hook.check_for_key(f'{VIEW_QUERY_S3_PATH}{file_name}',S3_BUCKET):
+
+        file_obj = s3_hook.get_conn().get_object(Bucket=S3_BUCKET, Key=f'{VIEW_QUERY_S3_PATH}{file_name}')
+
+        file_content = file_obj['Body'].read().decode('utf-8')
+
+        # print(file_content)
+
+ 
+
+        return file_content
+
+ 
+
+def execute_athena_query(sql_query, database, output_location):
+
+    response = athena_client.start_query_execution(
+
+        QueryString=sql_query,
+
+        QueryExecutionContext = {
+
+            'Database':database
+
+        },
+
+        ResultConfiguration = {
+
+            'OutputLocation':output_location
+
+        }
+
+    )
+
+    return response
+
+ 
+
+def has_athena_query_succeeded(query_execution_id):
+
+    state = "RUNNING"
+
+    max_execution = 10
+
+ 
+
+    while max_execution > 0 and state in ["RUNNING", "QUEUED"]:
+
+        max_execution -= 1
+
+        response = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+
+        if (
+
+            "QueryExecution" in response
+
+            and "Status" in response["QueryExecution"]
+
+            and "State" in response["QueryExecution"]["Status"]
+
+        ):
+
+            state = response["QueryExecution"]["Status"]["State"]
+
+            if state == "SUCCEEDED":
+
+                return True
+
+ 
+
+        time.sleep(30)
+
+ 
+
+    return False
+
+ 
+
+def copy_files(copy_source, dest_bucket, dest_key):
+
+    response = s3_client.copy_object(
+
+        CopySource= copy_source,
+
+        Bucket= dest_bucket,
+
+        Key= dest_key
+
+    )
+
+ 
+
+    return response
+
+ 
+
+@task()
+
+def get_files():
+
+    keys = s3_hook.list_keys(bucket_name = S3_BUCKET, prefix=VIEW_QUERY_S3_PATH)
+
+    if VIEW_QUERY_S3_PATH in keys:
+
+        keys.remove(VIEW_QUERY_S3_PATH)
+
+ 
+
+    sql_files_list = list(map(lambda x: x.replace(VIEW_QUERY_S3_PATH,''), keys))
+
+    print(sql_files_list)
+
+    for file in sql_files_list:
+
+        print(file)
+
+ 
+
+    return sql_files_list
+
+ 
+
+@task(multiple_outputs=True)
+
+def runquery_store_result(sql_files_list):
+
+    print('sql files list')
+
+    print(sql_files_list)
+
+    for file in sql_files_list:
+
+        print('file name')
+
+        print(file)
+
+        sql_view_name = file.split(".")[0]
+
+        print("fsql_view_name ")
+
+        print(sql_view_name)
+
+        get_sql_query
+
+        sql_query = get_sql_query(file)
+
+            ## Run athena query
+
+        # athena_query_res = execute_athena_query(sql_query=QUERY_READ_TABLE, database=ATHENA_DATABASE, output_location=f's3://{S3_BUCKET}/{S3_KEY}/')
+
+        athena_query_res = execute_athena_query(sql_query=sql_query, database=ATHENA_DATABASE, output_location=f's3://{S3_BUCKET}/{S3_KEY_ATHENA_RESULT}/')
+
+        print(athena_query_res)
+
+        if 'QueryExecutionId' in athena_query_res:
+
+            query_execution_id = athena_query_res['QueryExecutionId']
+
+            ## check athena query completed
+
+            athena_query_status = has_athena_query_succeeded(query_execution_id=query_execution_id)
+
+            if athena_query_status:
+
+                ## athena query successfully completed , copy the result to specific path
+
+                copy_source =f'/{S3_BUCKET}/{S3_KEY_ATHENA_RESULT}/{query_execution_id}.csv'
+
+                dest_bucket = S3_BUCKET
+
+                dest_key = f'{VIEW_QUERY_RESULT_S3_PATH}/{sql_view_name}/{sql_view_name}.csv'
+
+                copy_file_res = copy_files(copy_source, dest_bucket, dest_key)
+
+                print(copy_file_res)
+
+ 
+
+with DAG(
+
+    dag_id=DAG_ID,
+
+    schedule_interval='@once',
+
+    start_date=datetime(2021, 1, 1),
+
+    tags=['example'],
+
+    catchup=False,
+
+) as dag:
+
+ 
+
+ 
+
+    # [START howto_operator_step_function_start_execution]
+
+    start_execution = StepFunctionStartExecutionOperator(
+
+        task_id='start_execution', state_machine_arn=state_machine_arn
+
+    )
+
+    # [END howto_operator_step_function_start_execution]
+
+ 
+
+    # [START howto_sensor_step_function_execution]
+
+    wait_for_execution = StepFunctionExecutionSensor(
+
+        task_id='wait_for_execution', execution_arn=start_execution.output
+
+    )
+
+    # [END howto_sensor_step_function_execution]
+
+ 
+
+    # [START howto_operator_step_function_get_execution_output]
+
+    get_execution_output = StepFunctionGetExecutionOutputOperator(
+
+        task_id='get_execution_output', execution_arn=start_execution.output
+
+    )
+
+    # [END howto_operator_step_function_get_execution_output]
+
+ 
+
+    sql_files_list = get_files()
+
+    res_data = runquery_store_result(sql_files_list)
+
+ 
+
+    chain(
+
+        start_execution,
+
+        wait_for_execution,
+
+        get_execution_output,
+
+        sql_files_list,
+
+        res_data
+
+ 
+
+    )
+
+ 
+
+======================
+
+from airflow import DAG
+
+from airflow.models import Variable
+
+from airflow.providers.amazon.aws.operators.emr import (
+
+    EmrCreateJobFlowOperator,
+
+    EmrTerminateJobFlowOperator,
+
+    EmrAddStepsOperator,
+
+)
+
+from airflow.providers.amazon.aws.sensors.emr import (
+
+    EmrJobFlowSensor,
+
+    EmrStepSensor,
+
+)
+
+from airflow.utils.trigger_rule import TriggerRule
+
+from airflow.providers.amazon.aws.operators.glue_crawler import GlueCrawlerOperator
+
+ 
+
+from datetime import datetime, timedelta
+
+ 
+
+## variables
+
+ENV = Variable.get("ENV")
+
+emr_logs_s3_bucket = f"gilead-ds-emr-logs-{ENV}"
+
+ 
+
+Ec2SubnetId = {
+
+    "sbx":"subnet-0e146a6bf6d7d94d4",
+
+    "dev":"subnet-02d23709cbedb4333",
+
+    "prd":"subnet-0922202ccba53bc9e"
+
+}
+
+ 
+
+vpc_security_group_id = {
+
+    "sbx":["sg-0d5fdd4718b9ce889"],
+
+    "dev":["sg-00e01afdd18c5f171"],
+
+    "tst":["sg-0afeb5e31f7fc2e96"],
+
+    "prd":["sg-0afeb5e31f7fc2e96", "sg-00bf14773fc9484d0"],
+
+}
+
+ 
+
+Ec2KeyName = {
+
+    "sbx":"ETMF-INGEST-WEST-2",
+
+    "dev":"gilead_gilda_ds_airflow_emr",
+
+    "prd":"gilead_gilda_ds_airflow_emr"
+
+}
+
+ 
+
+JobFlowRole = {
+
+    "sbx":"AmazonEMR-InstanceProfile-20230405T134725",
+
+    "dev":"GileadDS-AmazonEMR-InstanceProfile",
+
+    "prd":"GileadDS-AmazonEMR-InstanceProfile"
+
+}
+
+ 
+
+ServiceRole = {
+
+    "sbx":"emr-access",
+
+    "dev":"gilead_ds_emr_access",
+
+    "prd":"gilead_ds_emr_access"
+
+}
+
+ 
+
+# Set Airflow args
+
+default_args = {
+
+    'owner': 'airflow',
+
+    'start_date': datetime(2023, 10, 1),
+
+    # 'retries': 5,
+
+    # 'retry_delay': timedelta(minutes=2)
+
+    # 'retry_exponential_backoff': True,  # Optional: Exponential backoff for retries
+
+}
+
+ 
+
+# Setup Airflow
+
+with DAG(
+
+    dag_id='gilead_ds_lakebound_baseline_emr',
+
+    default_args=default_args,
+
+    schedule_interval='45 23 * * *',
+
+    catchup=False,
+
+) as dag:
+
+ 
+
+    JOB_FLOW_OVERRIDES = {
+
+        'Name': 'EMR cluster with Polars',
+
+        'ReleaseLabel': 'emr-7.1.0',
+
+        # 'Applications': [{'Name': 'Hadoop'}],
+
+        'Instances': {
+
+            'InstanceGroups': [
+
+                {
+
+                    'Name': 'Single node',
+
+                    'Market': 'ON_DEMAND',
+
+                    'InstanceRole': 'MASTER',
+
+                    'InstanceType': 'm5.8xlarge',
+
+                    'InstanceCount': 1,
+
+                },
+
+            ],
+
+            'KeepJobFlowAliveWhenNoSteps': True,
+
+            'TerminationProtected': False,
+
+            'Ec2KeyName': Ec2KeyName[ENV], #'gilead_gilda_ds_airflow_emr', #'ETMF-INGEST-WEST-2',
+
+            'Ec2SubnetId': Ec2SubnetId[ENV], #'subnet-0e146a6bf6d7d94d4',
+
+            'AdditionalMasterSecurityGroups':vpc_security_group_id[ENV], #["sg-0d5fdd4718b9ce889"],
+
+            'AdditionalSlaveSecurityGroups':vpc_security_group_id[ENV], #["sg-0d5fdd4718b9ce889"],
+
+        },
+
+        'BootstrapActions': [
+
+            {
+
+                'Name': 'Install polars',
+
+                'ScriptBootstrapAction': {
+
+                   'Path': f's3://gilead-ds-mwaa-airflow-lakebound-{ENV}/emr-jobs/emr_polars_startup_script.sh',
+
+                    'Args': [],
+
+                },
+
+            },
+
+        ],
+
+        'Configurations': [],
+
+        "JobFlowRole": JobFlowRole[ENV], ##"GileadDS-AmazonEMR-InstanceProfile",
+
+        "ServiceRole": ServiceRole[ENV], ##"gilead_ds_emr_access",
+
+        'LogUri': f's3://{emr_logs_s3_bucket}/'
+
+    }
+
+ 
+
+    create_cluster = EmrCreateJobFlowOperator(
+
+        task_id='create_cluster',
+
+        job_flow_overrides=JOB_FLOW_OVERRIDES
+
+    )
+
+ 
+
+    wait_for_cluster = EmrJobFlowSensor(
+
+        task_id='wait_for_cluster',
+
+        job_flow_id=create_cluster.output,
+
+        target_states=["RUNNING", "WAITING"],
+
+        failed_states=["TERMINATED_WITH_ERRORS"],
+
+        max_attempts=60,
+
+        poke_interval=60
+
+    )
+
+ 
+
+    process_baseline_step = [
+
+        {
+
+            'Name': 'Process Baseline CSV with Polars',
+
+            'ActionOnFailure': 'CONTINUE',
+
+            'HadoopJarStep': {
+
+                'Jar': 'command-runner.jar',
+
+                'Args': [
+
+                    'bash',
+
+                    '-c',
+
+                    (
+
+                        f'aws s3 cp s3://gilead-ds-mwaa-airflow-lakebound-{ENV}/emr-jobs/gilead_ds_lakebound_process_baseline.py /home/hadoop/ && '
+
+                        f'python3 /home/hadoop/gilead_ds_lakebound_process_baseline.py --env {ENV}'
+
+                    ),
+
+                ],
+
+            },
+
+        },
+
+    ]
+
+ 
+
+    process_baseline_csv = EmrAddStepsOperator(
+
+        task_id='process_baseline_csv',
+
+        job_flow_id=create_cluster.output,
+
+        steps=process_baseline_step
+
+    )
+
+ 
+
+    wait_for_baseline_processing = EmrStepSensor(
+
+        task_id='wait_for_baseline_processing',
+
+        job_flow_id=create_cluster.output,
+
+        step_id="{{ task_instance.xcom_pull(task_ids='process_baseline_csv', key='return_value')[0] }}"
+
+    )
+
+ 
+
+    terminate_cluster = EmrTerminateJobFlowOperator(
+
+        task_id='terminate_cluster',
+
+        job_flow_id=create_cluster.output,
+
+        trigger_rule=TriggerRule.ALL_DONE
+
+    )
+
+ 
+
+    check_emr_terminated = EmrJobFlowSensor(
+
+        task_id="check_emr_terminated",
+
+        job_flow_id=create_cluster.output,
+
+        target_states= ["TERMINATED"],
+
+        failed_states=["TERMINATED_WITH_ERRORS"],
+
+        max_attempts=60,
+
+        poke_interval=60
+
+    )
+
+ 
+
+    run_glue_crawler = GlueCrawlerOperator(
+
+        task_id='run_glue_crawler',
+
+        config={'Name': 'gplan_baseline_crawler_bronze_s3'},
+
+        wait_for_completion=True
+
+    )
+
+ 
+
+    # Define task dependencies
+
+    create_cluster >> wait_for_cluster >> process_baseline_csv >> wait_for_baseline_processing >> terminate_cluster >> check_emr_terminated >> run_glue_crawler
+
+ 
+
+ 
+
+================================
+
+from airflow import DAG
+
+from airflow.decorators import task
+
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+from airflow.utils.dates import days_ago
+
+ 
+
+from datetime import datetime, timedelta
+
+from io import StringIO
+
+import psutil
+
+ 
+
+import polars as pl
+
+ 
+
+BRONZE_BUCKET = 'gilead-ds-lakebound-data-store-sbx'
+
+GPLAN_FOLDER = 'bronze/gplan'
+
+BASELINE_EXPORT_PROCESSED_CSV = f'{GPLAN_FOLDER}/BASELINE/BASELINE_EXPORT_PROCESSED.csv'
+
+ 
+
+# Initialize S3Hook
+
+s3_hook = S3Hook(aws_conn_id='aws_default')
+
+ 
+
+# Default arguments for the DAG
+
+default_args = {
+
+    'owner': 'airflow',
+
+   'start_date': days_ago(1),
+
+}
+
+ 
+
+# Check if BASELINE_EXPORT_PROCESSED.csv exists
+
+def check_if_baseline_export_processed_exists() -> bool:
+
+    if not s3_hook.check_for_key(key=BASELINE_EXPORT_PROCESSED_CSV, bucket_name=BRONZE_BUCKET):
+
+        print('Processed baseline csv does not exist.')
+
+        return False
+
+    return True
+
+ 
+
+ 
+
+ 
+
+# Define the DAG
+
+with DAG(
+
+    dag_id='gilead_ds_lakebound_baseline_incremental_composite',
+
+    default_args=default_args,
+
+    schedule_interval=None,
+
+    description='DAG to process Baseline export CSVs',
+
+) as dag:
+
+   
+
+    @task
+
+    def process_incremental_baseline_csv():
+
+        '''
+
+        # Load BASELINE_EXPORT_PROCESSED.csv CreatedDate into a Polars DataFrame
+
+        processed_csv = s3_hook.get_key(key=BASELINE_EXPORT_PROCESSED_CSV, bucket_name=BRONZE_BUCKET)
+
+        processed_df_created_date = pl.read_csv(processed_csv.get()['Body'], columns=['CreatedDate'], encoding='utf8', infer_schema=False).unique()
+
+ 
+
+        # Format CreatedDate as a datetime and extract the last CreatedDate
+
+        processed_df_created_date = processed_df_created_date.with_columns([pl.col('CreatedDate').str.strptime(pl.Date, format="%m/%d/%Y")])
+
+        last_created_date = processed_df_created_date.select(pl.col('CreatedDate').max()).to_dict(as_series=False)['CreatedDate'][0]
+
+ 
+
+        # Calculate next CreatedDate and the current date
+
+        next_created_date = last_created_date + timedelta(days=1)
+
+        current_date = datetime.now().date()
+
+        '''
+
+        if not s3_hook.check_for_key(key=BASELINE_EXPORT_PROCESSED_CSV, bucket_name=BRONZE_BUCKET):
+
+            initial_baseline_csv_export = f'{GPLAN_FOLDER}/import/09262024/BASELINE_EXPORT.csv'
+
+            initial_baseline_csv = s3_hook.get_key(key=initial_baseline_csv_export, bucket_name=BRONZE_BUCKET)
+
+            initial_baseline_df = pl.read_csv(initial_baseline_csv.get()['Body'], encoding='utf-8', infer_schema=False, low_memory=True)
+
+ 
+
+            # Cast all columns to UTF-8 and remove all commas
+
+            initial_baseline_df = initial_baseline_df.with_columns([
+
+                pl.col(col).cast(pl.Utf8).str.replace_all(",", "").alias(col)
+
+                for col in initial_baseline_df.columns
+
+            ])
+
+ 
+
+            # Add new fields
+
+            initial_baseline_df = initial_baseline_df.with_columns([
+
+                pl.lit('Y').alias('Active_flg'),
+
+                pl.lit(datetime.now().strftime('2024')).alias('CreatedDate_Year'),
+
+                pl.lit(datetime.now().strftime('09')).alias('CreatedDate_Month'),
+
+                pl.lit(datetime.now().strftime('09/26/2024')).alias('CreatedDate'),
+
+                # pl.lit(datetime.now().strftime('%Y')).alias('CreatedDate_Year'),
+
+                # pl.lit(datetime.now().strftime('%m')).alias('CreatedDate_Month'),
+
+                # pl.lit(datetime.now().strftime('%m/%d/%Y')).alias('CreatedDate'),
+
+                pl.lit(None).alias('EndDate')
+
+            ])
+
+ 
+
+            # Write the modified DataFrame back to S3
+
+            csv_buffer = StringIO()
+
+            initial_baseline_df.write_csv(csv_buffer)
+
+            s3_hook.load_string(
+
+                string_data=csv_buffer.getvalue(),
+
+                key=BASELINE_EXPORT_PROCESSED_CSV,
+
+                bucket_name=BRONZE_BUCKET,
+
+                replace=True
+
+            )
+
+ 
+
+        #####################
+
+        #      End of       #
+
+        #    Initial Load   #
+
+        #####################
+
+ 
+
+        first_date = datetime.strptime("09/27/2024", "%m/%d/%Y")
+
+        final_date = datetime.strptime("10/03/2024", "%m/%d/%Y")
+
+        # while next_created_date <= current_date:
+
+        while first_date <= final_date:
+
+            print(f"Memory Usage: {psutil.virtual_memory().percent}%")
+
+            print(f"CPU Usage: {psutil.cpu_percent()}%")
+
+            # new_baseline_export = f'{GPLAN_FOLDER}/import/{next_created_date.strftime("%m%d%Y")}/BASELINE_EXPORT.csv'
+
+            new_baseline_export = f'{GPLAN_FOLDER}/import/{first_date.strftime("%m%d%Y")}/BASELINE_EXPORT.csv'
+
+           
+
+            # Check if new BASELINE_EXPORT.csv exists
+
+            if s3_hook.check_for_key(key=new_baseline_export, bucket_name=BRONZE_BUCKET):
+
+                print(f'Processing {first_date.strftime("%m/%d/%Y")} Baseline Export...')
+
+               
+
+                # Load BASELINE_EXPORT_PROCESSED.csv into a Polars DataFrame
+
+                processed_csv = s3_hook.get_key(key=BASELINE_EXPORT_PROCESSED_CSV, bucket_name=BRONZE_BUCKET)
+
+                processed_df = pl.read_csv(processed_csv.get()['Body'], encoding='utf-8', infer_schema=False, low_memory=True)
+
+               
+
+                # Load new BASELINE_EXPORT.csv into a Polars DataFrame
+
+                new_baseline_csv = s3_hook.get_key(key=new_baseline_export, bucket_name=BRONZE_BUCKET)
+
+                new_baseline_df = pl.read_csv(new_baseline_csv.get()['Body'], encoding='utf-8', infer_schema=False, low_memory=True)
+
+               
+
+                # Cast all columns to UTF-8 and remove all commas
+
+                new_baseline_df = new_baseline_df.with_columns([
+
+                    pl.col(col).cast(pl.Utf8).str.replace_all(",", "").alias(col)
+
+                    for col in new_baseline_df.columns
+
+                ])
+
+               
+
+                # Add new fields
+
+                new_baseline_df = new_baseline_df.with_columns([
+
+                    pl.lit('Y').alias('Active_flg'),
+
+                    # pl.lit(datetime.now().strftime('%Y')).alias('CreatedDate_Year'),
+
+                    # pl.lit(datetime.now().strftime('%m')).alias('CreatedDate_Month'),
+
+                    # pl.lit(datetime.now().strftime('%m/%d/%Y')).alias('CreatedDate'),
+
+                    pl.lit(first_date.strftime('%Y')).alias('CreatedDate_Year'),
+
+                    pl.lit(first_date.strftime('%m')).alias('CreatedDate_Month'),
+
+                    pl.lit(first_date.strftime('%m/%d/%Y')).alias('CreatedDate'),
+
+                    pl.lit(None).alias('EndDate')
+
+                ])
+
+               
+
+                #####################
+
+                #   Incremental     #
+
+                #       Load        #
+
+                #####################
+
+                
+
+                # Create composite keys using tuples for processed_df
+
+                processed_df = processed_df.with_columns(
+
+                    pl.struct([pl.col("Project.Internal number").cast(pl.Utf8), pl.col("Internal number").cast(pl.Utf8)]).alias("composite_key")
+
+                )
+
+ 
+
+                # Create composite keys using tuples for new_baseline_df
+
+                new_baseline_df = new_baseline_df.with_columns(
+
+                    pl.struct([pl.col("Project.Internal number").cast(pl.Utf8), pl.col("Internal number").cast(pl.Utf8)]).alias("composite_key")
+
+                )
+
+ 
+
+                # Create a condition to check if composite keys are in new_baseline_df and Active_flg is 'Y'
+
+                condition = (
+
+                    (processed_df["composite_key"].is_in(new_baseline_df["composite_key"])) &
+
+                    (processed_df["Active_flg"] == 'Y')
+
+                )
+
+               
+
+                # If the condition is True, update the Active_flg to 'N'
+
+                processed_df = (
+
+                    processed_df.with_columns([
+
+                        pl.when(condition).then(pl.lit('N')).otherwise(pl.col('Active_flg')).alias('Active_flg'),
+
+                        # pl.when(condition).then(pl.lit(datetime.now().strftime('%m/%d/%Y'))).otherwise(pl.col('EndDate')).alias('EndDate')
+
+                        pl.when(condition).then(pl.lit(first_date.strftime('%m/%d/%Y'))).otherwise(pl.col('EndDate')).alias('EndDate')
+
+                    ])
+
+                )
+
+               
+
+                # **Drop the composite_key column before writing to CSV**
+
+                processed_df = processed_df.drop("composite_key")
+
+                new_baseline_df = new_baseline_df.drop("composite_key")
+
+               
+
+                # Concatenate the updated processed_df with new_baseline_df
+
+                final_df = pl.concat([processed_df, new_baseline_df])
+
+ 
+
+                # Convert the DataFrame to CSV format
+
+                csv_buffer = StringIO()
+
+                final_df.write_csv(csv_buffer)
+
+               
+
+                # Write the processed CSV back to S3
+
+                s3_hook.load_string(
+
+                    string_data=csv_buffer.getvalue(),
+
+                    key=BASELINE_EXPORT_PROCESSED_CSV,
+
+                    bucket_name=BRONZE_BUCKET,
+
+                    replace=True
+
+                )
+
+               
+
+                print(f"Successfully uploaded the processed CSV to s3://{BRONZE_BUCKET}/{BASELINE_EXPORT_PROCESSED_CSV}")
+
+               
+
+                # Increment next_created_date by one day
+
+                # next_created_date += timedelta(days=1)
+
+                first_date += timedelta(days=1)
+
+ 
+
+    # Execute task
+
+    process_incremental_baseline_csv()
+
+==================================
+
+
+ 
+
+ from airflow import DAG
+
+from airflow.models import Variable
+
+from airflow.providers.amazon.aws.operators.emr import (
+
+    EmrCreateJobFlowOperator,
+
+    EmrTerminateJobFlowOperator,
+
+    EmrAddStepsOperator,
+
+)
+
+from airflow.providers.amazon.aws.sensors.emr import (
+
+    EmrJobFlowSensor,
+
+    EmrStepSensor,
+
+)
+
+from airflow.providers.amazon.aws.operators.glue_crawler import GlueCrawlerOperator
+
+ 
+
+from datetime import datetime, timedelta
+
+from airflow.utils.trigger_rule import TriggerRule
+
+ 
+
+## variables
+
+ENV = Variable.get("ENV")
+
+emr_logs_s3_bucket = f"gilead-ds-emr-logs-{ENV}"
+
+ 
+
+Ec2SubnetId = {
+
+    "sbx":"subnet-0e146a6bf6d7d94d4",
+
+    "dev":"subnet-02d23709cbedb4333",
+
+    "prd":"subnet-0922202ccba53bc9e"
+
+}
+
+ 
+
+vpc_security_group_id = {
+
+    "sbx":["sg-0d5fdd4718b9ce889"],
+
+    "dev":["sg-00e01afdd18c5f171"],
+
+    "tst":["sg-0afeb5e31f7fc2e96"],
+
+    "prd":["sg-0afeb5e31f7fc2e96", "sg-00bf14773fc9484d0"],
+
+}
+
+ 
+
+Ec2KeyName = {
+
+    "sbx":"ETMF-INGEST-WEST-2",
+
+    "dev":"gilead_gilda_ds_airflow_emr",
+
+    "prd":"gilead_gilda_ds_airflow_emr"
+
+}
+
+ 
+
+JobFlowRole = {
+
+    "sbx":"AmazonEMR-InstanceProfile-20230405T134725",
+
+    "dev":"GileadDS-AmazonEMR-InstanceProfile",
+
+    "prd":"GileadDS-AmazonEMR-InstanceProfile"
+
+}
+
+ 
+
+ServiceRole = {
+
+    "sbx":"emr-access",
+
+    "dev":"gilead_ds_emr_access",
+
+    "prd":"gilead_ds_emr_access"
+
+}
+
+ 
+
+# Set Airflow args
+
+default_args = {
+
+    'owner': 'airflow',
+
+    'start_date': datetime(2023, 10, 1),
+
+    # 'retries': 5,
+
+    # 'retry_delay': timedelta(minutes=2)
+
+    # 'retry_exponential_backoff': True,  # Optional: Exponential backoff for retries
+
+}
+
+ 
+
+# Setup Airflow
+
+with DAG(
+
+    dag_id='gilead_ds_lakebound_bp_report',
+
+    default_args=default_args,
+
+    schedule_interval='0 16 * * 1-5',
+
+    catchup=False,
+
+) as dag:
+
+ 
+
+    JOB_FLOW_OVERRIDES = {
+
+        'Name': 'EMR cluster for BP Report',
+
+        'ReleaseLabel': 'emr-7.1.0',
+
+        # 'Applications': [{'Name': 'Hadoop'}],
+
+        'Instances': {
+
+            'InstanceGroups': [
+
+                {
+
+                    'Name': 'Single node',
+
+                    'Market': 'ON_DEMAND',
+
+                    'InstanceRole': 'MASTER',
+
+                    'InstanceType': 'm5.4xlarge',
+
+                    'InstanceCount': 1,
+
+                },
+
+            ],
+
+            'KeepJobFlowAliveWhenNoSteps': True,
+
+            'TerminationProtected': False,
+
+            'Ec2KeyName': Ec2KeyName[ENV], #'gilead_gilda_ds_airflow_emr', #'ETMF-INGEST-WEST-2',
+
+            'Ec2SubnetId': Ec2SubnetId[ENV], #'subnet-0e146a6bf6d7d94d4',
+
+            'AdditionalMasterSecurityGroups':vpc_security_group_id[ENV], #["sg-0d5fdd4718b9ce889"],
+
+            'AdditionalSlaveSecurityGroups':vpc_security_group_id[ENV], #["sg-0d5fdd4718b9ce889"],
+
+        },
+
+        'BootstrapActions': [
+
+            {
+
+                'Name': 'Install polars',
+
+                'ScriptBootstrapAction': {
+
+                    'Path': f's3://gilead-ds-mwaa-airflow-lakebound-{ENV}/emr-jobs/emr_polars_startup_script.sh',
+
+                    'Args': [],
+
+                },
+
+            },
+
+        ],
+
+        'Configurations': [],
+
+        "JobFlowRole": JobFlowRole[ENV], ##"GileadDS-AmazonEMR-InstanceProfile",
+
+        "ServiceRole": ServiceRole[ENV], ##"gilead_ds_emr_access",
+
+        'LogUri': f's3://{emr_logs_s3_bucket}/'
+
+    }
+
+ 
+
+    create_cluster = EmrCreateJobFlowOperator(
+
+        task_id='create_cluster',
+
+        job_flow_overrides=JOB_FLOW_OVERRIDES
+
+    )
+
+ 
+
+    wait_for_cluster = EmrJobFlowSensor(
+
+        task_id='wait_for_cluster',
+
+        job_flow_id=create_cluster.output,
+
+        target_states=["RUNNING", "WAITING"],
+
+       failed_states=["TERMINATED_WITH_ERRORS"],
+
+        max_attempts=60,
+
+        poke_interval=60
+
+    )
+
+ 
+
+    process_bp_step = [
+
+        {
+
+            'Name': 'Process Bp CSV with Polars',
+
+            'ActionOnFailure': 'CONTINUE',
+
+            'HadoopJarStep': {
+
+                'Jar': 'command-runner.jar',
+
+                'Args': [
+
+                    'bash',
+
+                    '-c',
+
+                    (
+
+                        f'aws s3 cp s3://gilead-ds-mwaa-airflow-lakebound-{ENV}/emr-jobs/gilead_ds_lakebound_bp_report.py /home/hadoop/ && '
+
+                        f'python3 /home/hadoop/gilead_ds_lakebound_bp_report.py --env {ENV}'
+
+                    ),
+
+                ],
+
+            },
+
+        },
+
+    ]
+
+ 
+
+    process_bp_csv = EmrAddStepsOperator(
+
+        task_id='process_bp_csv',
+
+        job_flow_id=create_cluster.output,
+
+        steps=process_bp_step
+
+    )
+
+ 
+
+    wait_for_bp_processing = EmrStepSensor(
+
+        task_id='wait_for_bp_processing',
+
+        job_flow_id=create_cluster.output,
+
+        step_id="{{ task_instance.xcom_pull(task_ids='process_bp_csv', key='return_value')[0] }}"
+
+    )
+
+ 
+
+    run_glue_crawler = GlueCrawlerOperator(
+
+        task_id='run_glue_crawler',
+
+        config={'Name': 'gilead_ds_lakebound_bp_crawler'},
+
+        wait_for_completion=True
+
+    )
+
+    presigned_url_step = [
+
+        {
+
+            'Name': 'Process Bp Presigned URL with Polars',
+
+            'ActionOnFailure': 'CONTINUE',
+
+            'HadoopJarStep': {
+
+                'Jar': 'command-runner.jar',
+
+                'Args': [
+
+                    'bash',
+
+                    '-c',
+
+                    (
+
+                        f'aws s3 cp s3://gilead-ds-mwaa-airflow-lakebound-{ENV}/emr-jobs/gilead_ds_lakebound_presigned_url_bpreport.py /home/hadoop/ && '
+
+                        f'python3 /home/hadoop/gilead_ds_lakebound_presigned_url_bpreport.py --env {ENV}'
+
+                    ),
+
+                ],
+
+            },
+
+        },
+
+    ]
+
+    presigned_url_generation = EmrAddStepsOperator(
+
+        task_id='presigned_url_creation',
+
+        job_flow_id=create_cluster.output,
+
+        steps=presigned_url_step
+
+    )
+
+ 
+
+    wait_for_presigned_url = EmrStepSensor(
+
+        task_id='wait_for_presigned_url',
+
+        job_flow_id=create_cluster.output,
+
+        step_id="{{ task_instance.xcom_pull(task_ids='presigned_url_creation', key='return_value')[0] }}"
+
+    )
+
+ 
+
+    terminate_cluster = EmrTerminateJobFlowOperator(
+
+        task_id='terminate_cluster',
+
+        job_flow_id=create_cluster.output,
+
+        trigger_rule=TriggerRule.ALL_DONE
+
+    )
+
+ 
+
+    check_emr_terminated = EmrJobFlowSensor(
+
+        task_id="check_emr_terminated",
+
+        job_flow_id=create_cluster.output,
+
+        target_states= ["TERMINATED"],
+
+        failed_states=["TERMINATED_WITH_ERRORS"],
+
+        max_attempts=60,
+
+        poke_interval=60
+
+    )
+
+ 
+
+ 
+
+ 
+
+    # Define task dependencies
+
+    create_cluster >> wait_for_cluster >> process_bp_csv >> wait_for_bp_processing >>run_glue_crawler >> presigned_url_generation >> wait_for_presigned_url >> terminate_cluster >> check_emr_terminated
+
+                ===============================
+
+                from airflow import DAG
+
+from airflow.operators.python import PythonOperator
+
+from datetime import datetime
+
+from airflow.models import Variable
+
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+import boto3
+
+import time
+
+import json
+
+ 
+
+# Retrieve environment variable
+
+ENV = Variable.get("ENV")
+
+ 
+
+# S3 and Athena configuration
+
+bucket_name = f'gilead-ds-operational-datalake-{ENV}'
+
+QUERY_S3_PATH = 's3://gilead-ds-lakebound-data-store-sbx/artifacts/apttus/'
+
+S3_KEY_ATHENA_RESULT = 'athena-query-results/airflow'
+
+ATHENA_DATABASE = 'gilead_ds_datalake_ctms_silver'
+
+QUERY_RESULT_S3_PATH = 'ctms_apttus/'
+
+ 
+
+# Initialize Boto3 clients
+
+s3_client = boto3.client('s3')
+
+athena_client = boto3.client('athena')
+
+ 
+
+# Function to fetch and process queries from S3
+
+def fetch_queries(bucket_name, key, **kwargs):
+
+    """
+
+    Fetches SQL queries from an S3 file where there are no explicit delimiters
+
+    but queries are marked with titles like 'APTTUS Query 1:'.
+
+    """
+
+    print(f"Fetching SQL file from S3 bucket: {bucket_name}, key: {key}")
+
+    s3 = boto3.client('s3')
+
+    response = s3.get_object(Bucket=bucket_name, Key=key)
+
+    content = response['Body'].read().decode('utf-8')
+
+ 
+
+    print("File content retrieved:")
+
+    print(content)
+
+ 
+
+    # Splitting lines
+
+    lines = content.splitlines()
+
+ 
+
+    queries = []
+
+    current_query = {"title": None, "sql": ""}
+
+ 
+
+    for line in lines:
+
+        line = line.strip()  # Remove leading/trailing whitespace
+
+        if line.startswith("APTTUS Query"):  # Identify a query title
+
+            # Save the previous query if it exists
+
+            if current_query["title"] and current_query["sql"]:
+
+                queries.append(current_query)
+
+            # Start a new query
+
+            current_query = {"title": line, "sql": ""}
+
+        else:
+
+            current_query["sql"] += f"{line}\n"  # Append SQL lines to the current query
+
+ 
+
+    # Add the last query to the list
+
+    if current_query["title"] and current_query["sql"]:
+
+        queries.append(current_query)
+
+ 
+
+    print("Processed queries:")
+
+    for query in queries:
+
+        print(f"Title: {query['title']}")
+
+        print(f"SQL: {query['sql']}")
+
+ 
+
+    # Save the queries as a serialized variable in Airflow
+
+    Variable.set("apttus_queries", json.dumps(queries))
+
+    print("Queries saved to Airflow Variable 'apttus_queries'.")
+
+ 
+
+# Function to execute Athena query
+
+def execute_athena_query(sql_query, database, output_location):
+
+    response = athena_client.start_query_execution(
+
+        QueryString=sql_query,
+
+        QueryExecutionContext={'Database': database},
+
+        ResultConfiguration={'OutputLocation': output_location},
+
+    )
+
+    return response
+
+ 
+
+# Function to check Athena query status
+
+def has_athena_query_succeeded(query_execution_id):
+
+    state = "RUNNING"
+
+    max_execution = 10
+
+ 
+
+    while max_execution > 0 and state in ["RUNNING", "QUEUED"]:
+
+        max_execution -= 1
+
+        response = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
+
+        print(f"Query Execution Response: {response}")  # Debugging
+
+ 
+
+        if (
+
+            "QueryExecution" in response
+
+            and "Status" in response["QueryExecution"]
+
+            and "State" in response["QueryExecution"]["Status"]
+
+        ):
+
+            state = response["QueryExecution"]["Status"]["State"]
+
+            print(f"Current State: {state}")  # Debugging
+
+            if state == "SUCCEEDED":
+
+                return True
+
+            elif state == "FAILED":
+
+                print(f"Query Failed: {response['QueryExecution']['Status']}")  # Debugging
+
+                return False
+
+ 
+
+        time.sleep(30)
+
+ 
+
+    print("Query did not complete within the allowed time.")  # Debugging
+
+    return False
+
+ 
+
+# Function to copy Athena query results to S3
+
+def copy_files(copy_source, dest_bucket, dest_key):
+
+    response = s3_client.copy_object(
+
+        CopySource=copy_source,
+
+        Bucket=dest_bucket,
+
+        Key=dest_key,
+
+    )
+
+    return response
+
+ 
+
+# Function to execute queries sequentially and store results
+
+def execute_and_store_results(**kwargs):
+
+    # Fetch queries from the Airflow Variable
+
+    queries = json.loads(Variable.get("apttus_queries"))
+
+    print(f"Fetched Queries: {queries}")  # Debugging
+
+ 
+
+    for query in queries:
+
+        query_name = query["title"].replace(" ", "_")
+
+        sql_query = query["sql"]
+
+        print(f"Processing Query: {query_name}")  # Print query name
+
+        print(f"SQL Query: {sql_query}")  # Print the query
+
+ 
+
+        # Execute Athena query
+
+        athena_query_res = execute_athena_query(
+
+            sql_query=sql_query,
+
+            database=ATHENA_DATABASE,
+
+            output_location=f's3://{bucket_name}/{S3_KEY_ATHENA_RESULT}/',
+
+        )
+
+        print(f"Athena Query Response: {athena_query_res}")  # Debugging
+
+ 
+
+        if 'QueryExecutionId' in athena_query_res:
+
+            query_execution_id = athena_query_res['QueryExecutionId']
+
+            print(f"Query Execution ID: {query_execution_id}")  # Debugging
+
+ 
+
+            # Check Athena query completion
+
+            athena_query_status = has_athena_query_succeeded(query_execution_id=query_execution_id)
+
+            if athena_query_status:
+
+                # Verify if the result exists in S3
+
+                result_file = f'{S3_KEY_ATHENA_RESULT}/{query_execution_id}.csv'
+
+                print(f"Checking for result file: s3://{bucket_name}/{result_file}")  # Debugging
+
+ 
+
+                try:
+
+                    s3_client.head_object(Bucket=bucket_name, Key=result_file)
+
+                    print(f"Result file exists: {result_file}")
+
+ 
+
+                    # Read and print the result file content
+
+                    result_obj = s3_client.get_object(Bucket=bucket_name, Key=result_file)
+
+                    result_data = result_obj['Body'].read().decode('utf-8')
+
+                    print(f"Data for Query {query_name}:\n{result_data}")  # Print data
+
+ 
+
+                    # Copy the result to the specific path
+
+                    copy_source = f'{bucket_name}/{result_file}'
+
+                    dest_bucket = bucket_name
+
+                    dest_key = f'{QUERY_RESULT_S3_PATH}queries/{query_name}/{query_name}.csv'
+
+                    #dest_key = f'{QUERY_RESULT_S3_PATH}/{query_name}/{query_name}.csv'
+
+                    copy_file_res = copy_files(copy_source, dest_bucket, dest_key)
+
+                    print(f"Copied result to {dest_key}: {copy_file_res}")
+
+                except s3_client.exceptions.ClientError as e:
+
+                    print(f"Result file not found: {e}")
+
+            else:
+
+                print(f"Query {query['title']} failed or did not complete successfully.")
+
+ 
+
+# Default arguments for the DAG
+
+default_args = {
+
+    'owner': 'airflow',
+
+    'depends_on_past': False,
+
+    'start_date': datetime(2024, 1, 1),
+
+    'retries': 1,
+
+}
+
+ 
+
+# Define the DAG
+
+with DAG(
+
+    'veeva_apttus_s3',
+
+    default_args=default_args,
+
+    schedule_interval=None,
+
+    catchup=False,
+
+) as dag:
+
+    fetch_query_task = PythonOperator(
+
+        task_id='fetch_query',
+
+        python_callable=fetch_queries,
+
+        op_kwargs={'bucket_name': 'gilead-ds-lakebound-data-store-sbx',
+
+        'key':'artifacts/apttus/APTTUS_Query.txt'},
+
+    )
+
+ 
+
+    execute_and_store_task = PythonOperator(
+
+        task_id='execute_and_store',
+
+        python_callable=execute_and_store_results,
+
+    )
+
+ 
+
+    fetch_query_task >> execute_and_store_task
+
+ 
